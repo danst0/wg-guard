@@ -225,7 +225,7 @@ trap on_hup HUP
 # Rueckgabe: 0 gesund, 1 Sonde fehlgeschlagen (Toleranz greift),
 #            3 Sicherheitsverletzung (sofort herunterfahren).
 health_check() {
-	if ! check_default_route_safe; then
+	if ! check_routing_safe; then
 		STAGE_REASON="$SAFETY_REASON"
 		HEALTH_STAGE="Q"
 		return 3
@@ -244,6 +244,12 @@ health_check() {
 	stage5_tcp || rc=$?
 	if [ "$rc" -ne 0 ]; then
 		HEALTH_STAGE="5"
+		return "$rc"
+	fi
+	rc=0
+	stage6_external || rc=$?
+	if [ "$rc" -ne 0 ]; then
+		HEALTH_STAGE="6"
 		return "$rc"
 	fi
 	return 0
@@ -305,6 +311,16 @@ attempt_connect() {
 		return 1
 	fi
 	ST_LAST_STAGE_OK="5"
+
+	rc=0
+	stage6_external || rc=$?
+	if [ "$rc" -ne 0 ]; then
+		record_failure "6" "$STAGE_REASON"
+		log_info "Stufe 6 fehlgeschlagen: $STAGE_REASON"
+		ensure_down "kein Internet durch den Tunnel" || true
+		return 1
+	fi
+	if is_full_tunnel; then ST_LAST_STAGE_OK="6"; fi
 
 	return 0
 }

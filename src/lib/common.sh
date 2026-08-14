@@ -169,6 +169,18 @@ load_defaults() {
 	: "${TCP_HEALTH:=}"
 	: "${ENDPOINT_HOST:=}" # leer = aus der Peer-Konfiguration lesen
 
+	# Betriebsart. Beim Split-Tunnel erschliesst der Tunnel nur interne Netze,
+	# beim Full-Tunnel laeuft der gesamte Verkehr hindurch. Praktisch alle
+	# Sicherheitsinvarianten kehren sich zwischen beiden um.
+	: "${TUNNEL_MODE:=split}" # split | full
+
+	# Nur im Full-Modus: ohne ein externes Ziel wuerde ein Tunnel als gesund
+	# gelten, der zwar steht, hinter dem aber kein Internet mehr ist.
+	: "${EXTERNAL_CHECK_HOST:=1.1.1.1}"
+	: "${EXTERNAL_CHECK_TCP:=1.1.1.1:443}"
+	# Nach einem harten Herunterfahren die DNS-Konfiguration auffrischen.
+	: "${RESTORE_DNS_AFTER_HARD_DOWN:=yes}"
+
 	# Intervalle
 	: "${CHECK_INTERVAL_HEALTHY:=60}"
 	: "${CHECK_INTERVAL_IDLE:=15}"
@@ -230,13 +242,32 @@ config_is_complete() {
 	local missing=()
 	[ -n "$NM_CONNECTION" ] || missing+=("NM_CONNECTION")
 	[ -n "$WG_INTERFACE" ] || missing+=("WG_INTERFACE")
-	[ -n "$PING_HOST" ] || missing+=("PING_HOST")
+
+	case "$TUNNEL_MODE" in
+	split)
+		# Ohne internes Ziel liesse sich der Tunnel nicht pruefen.
+		[ -n "$PING_HOST" ] || missing+=("PING_HOST")
+		;;
+	full)
+		# Hier traegt das externe Ziel die Pruefung; interne sind optional.
+		if [ -z "$EXTERNAL_CHECK_HOST" ] && [ -z "$EXTERNAL_CHECK_TCP" ]; then
+			missing+=("EXTERNAL_CHECK_HOST oder EXTERNAL_CHECK_TCP")
+		fi
+		;;
+	*)
+		CONFIG_ERROR="TUNNEL_MODE ist \"$TUNNEL_MODE\", erlaubt sind split und full."
+		return 1
+		;;
+	esac
+
 	if [ "${#missing[@]}" -gt 0 ]; then
 		CONFIG_ERROR="Pflichtangaben fehlen in $CONFIG_FILE: ${missing[*]}"
 		return 1
 	fi
 	return 0
 }
+
+is_full_tunnel() { [ "$TUNNEL_MODE" = "full" ]; }
 
 # -------------------------------------------------------------- Zustand -----
 

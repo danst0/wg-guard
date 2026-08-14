@@ -31,21 +31,37 @@ stage0_network_ready() {
 		;;
 	esac
 
-	case "$conn" in
-	full) ;;
-	portal)
-		STAGE_REASON="Das Netz haengt hinter einer Anmeldeseite (Captive Portal)."
+	# Die Konnektivitaetsmeldung taugt nur als Ruhegrund, solange der Tunnel
+	# unten ist. Im Full-Modus mit laufendem Tunnel ist ein "limited" das
+	# Symptom eines toten Tunnels und gehoert in die Gesundheitspruefung –
+	# dort fuehrt es zum Herunterfahren statt zum Abwarten.
+	if ! is_full_tunnel || tunnel_is_down; then
+		case "$conn" in
+		full) ;;
+		portal)
+			STAGE_REASON="Das Netz haengt hinter einer Anmeldeseite (Captive Portal)."
+			return 1
+			;;
+		limited | none | unknown | "")
+			STAGE_REASON="Netzverbindung eingeschraenkt (\"${conn:-unbekannt}\")."
+			return 1
+			;;
+		*)
+			STAGE_REASON="Unerwarteter Verbindungszustand \"$conn\"."
+			return 1
+			;;
+		esac
+	fi
+
+	if is_full_tunnel; then
+		# Gesucht ist der Uplink darunter, nicht die Default-Route: die gehoert
+		# hier im Betrieb dem Tunnel.
+		if uplink_available; then
+			return 0
+		fi
+		STAGE_REASON="$SAFETY_REASON"
 		return 1
-		;;
-	limited | none | unknown | "")
-		STAGE_REASON="Netzverbindung eingeschraenkt (\"${conn:-unbekannt}\")."
-		return 1
-		;;
-	*)
-		STAGE_REASON="Unerwarteter Verbindungszustand \"$conn\"."
-		return 1
-		;;
-	esac
+	fi
 
 	dev="$(route_dev_for 1.1.1.1 2>/dev/null)" || dev=""
 	if [ -z "$dev" ]; then
@@ -76,11 +92,16 @@ stage1_resolve_endpoint() {
 	RESOLVED_ENDPOINT_HOST="$host"
 
 	if is_ip_literal "$host"; then
+		RESOLVED_ENDPOINT_IP="$host"
 		log_debug "Stufe 1 uebersprungen, Endpunkt ist eine IP-Adresse ($host)."
 		return 0
 	fi
 
-	if run_timeout "$DNS_TIMEOUT" getent ahosts "$host" >/dev/null 2>&1; then
+	local resolved
+	if resolved="$(run_timeout "$DNS_TIMEOUT" getent ahosts "$host" 2>/dev/null)"; then
+		# Erste Adresse merken: im Full-Modus wird damit geprueft, dass die
+		# Route zum Endpunkt nicht durch den Tunnel selbst laeuft.
+		RESOLVED_ENDPOINT_IP="$(printf '%s' "$resolved" | awk 'NF{print $1; exit}')"
 		return 0
 	fi
 
@@ -119,8 +140,8 @@ stage2_bring_up() {
 		return 1
 	fi
 
-	# Q1–Q3 sofort nach dem Hochfahren.
-	if ! check_default_route_safe; then
+	# Routenpruefung sofort nach dem Hochfahren – im Full-Modus gespiegelt.
+	if ! check_routing_safe; then
 		STAGE_REASON="Sicherheitsverletzung nach dem Hochfahren: $SAFETY_REASON"
 		return 3 # 3 = Sicherheitsverletzung, sofort down ohne Toleranz
 	fi
@@ -209,10 +230,16 @@ stage4_ping() {
 		log_debug "Stufe 4 ist deaktiviert."
 		return 0
 	}
-	[ -n "$PING_HOST" ] || {
+	if [ -z "$PING_HOST" ]; then
+		# Im Full-Modus traegt Stufe 6 die Pruefung; ein internes Ziel ist
+		# dort optional.
+		if is_full_tunnel; then
+			log_debug "Stufe 4 uebersprungen, kein internes Ziel konfiguriert."
+			return 0
+		fi
 		STAGE_REASON="PING_HOST ist nicht konfiguriert."
 		return 1
-	}
+	fi
 
 	# Q4 – der Pfad muss durch den Tunnel laufen, sonst testen wir das LAN.
 	if ! check_probe_path "$PING_HOST"; then
@@ -279,4 +306,57 @@ stage5_tcp() {
 
 	STAGE_REASON="Der interne Dienst $host:$port nimmt keine TCP-Verbindung an."
 	return 1
+}
+
+# ------------------------------ Stufe 6 – Internet durch den Tunnel ---------
+#
+# Nur im Full-Modus, und dort die wichtigste Stufe: ohne sie wuerde ein Tunnel
+# als gesund gelten, der zwar steht, hinter dem aber kein Internet mehr ist –
+# genau der Zustand, in dem die Nutzerin vor einem toten Rechner sitzt.
+stage6_external() {
+	STAGE_REASON=""
+	is_full_tunnel || return 0
+
+	local host port rc=0
+
+	if [ -n "$EXTERNAL_CHECK_HOST" ]; then
+		# Der Weg dorthin muss durch den Tunnel fuehren, sonst pruefen wir den
+		# Uplink statt des Tunnels.
+		if ! check_probe_path "$EXTERNAL_CHECK_HOST"; then
+			STAGE_REASON="$SAFETY_REASON"
+			return 3
+		fi
+		if [ "$STAGE4_ENABLED" = "yes" ]; then
+			local args=(-n -q -c "$PING_COUNT")
+			if [ -n "$PING_TIMEOUT_FLAG" ]; then args+=("$PING_TIMEOUT_FLAG" "$PING_TIMEOUT"); fi
+			if [ -n "$PING_BIND_FLAG" ]; then args+=("$PING_BIND_FLAG" "$WG_INTERFACE"); fi
+			if ! run_timeout "$((PING_TIMEOUT + 3))" ping "${args[@]}" "$EXTERNAL_CHECK_HOST" >/dev/null 2>&1; then
+				STAGE_REASON="Durch den Tunnel ist $EXTERNAL_CHECK_HOST nicht erreichbar – der Tunnel steht, aber dahinter ist kein Internet."
+				return 1
+			fi
+		fi
+	fi
+
+	if [ -n "$EXTERNAL_CHECK_TCP" ]; then
+		read -r host port <<<"$(tcp_split_host "$EXTERNAL_CHECK_TCP")"
+		if [ -z "$host" ] || [ -z "$port" ]; then
+			STAGE_REASON="EXTERNAL_CHECK_TCP=\"$EXTERNAL_CHECK_TCP\" ist kein gueltiges Host:Port."
+			return 1
+		fi
+		if ! check_probe_path "$host"; then
+			STAGE_REASON="$SAFETY_REASON"
+			return 3
+		fi
+		if [ "$TCP_METHOD" = "nc" ]; then
+			run_timeout "$((TCP_TIMEOUT + 2))" nc -z -w "$TCP_TIMEOUT" "$host" "$port" >/dev/null 2>&1 || rc=$?
+		else
+			run_timeout "$TCP_TIMEOUT" bash -c "exec 3<>/dev/tcp/$host/$port" >/dev/null 2>&1 || rc=$?
+		fi
+		if [ "$rc" -ne 0 ]; then
+			STAGE_REASON="Durch den Tunnel nimmt $host:$port keine Verbindung an – der Tunnel steht, aber dahinter ist kein Internet."
+			return 1
+		fi
+	fi
+
+	return 0
 }

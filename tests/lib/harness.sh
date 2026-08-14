@@ -35,6 +35,7 @@ sandbox_new() {
 	scen link_exists "0"
 	scen route_default_dev "eth0"
 	scen route_10.0.0.1 "wgtest0"
+	scen endpoint_ip "198.51.100.7"
 	scen handshake_ts "-30"
 	scen ping_rc "0"
 	scen tcp_rc "0"
@@ -312,4 +313,23 @@ load_libs() {
 	# shellcheck source=../../src/lib/safety.sh
 	. "$REPO_ROOT/src/lib/safety.sh"
 	load_defaults
+}
+
+# Stellt die Sandbox auf einen Full-Tunnel um: AllowedIPs mit Default-Route,
+# DNS im Profil, never-default aus - so wie eine echte Full-Tunnel-Verbindung.
+sandbox_full_tunnel() {
+	cfg TUNNEL_MODE "full"
+	cfg EXTERNAL_CHECK_HOST "1.1.1.1"
+	cfg EXTERNAL_CHECK_TCP ""
+	cfg PING_HOST ""
+	cfg TCP_HEALTH ""
+	keyfile_set_allowed_ips "0.0.0.0/0;::/0;"
+	prop ipv4.never-default "no"
+	prop ipv6.never-default "no"
+	prop ipv4.dns "10.0.41.1"
+	prop ipv6.dns "fd5a:8c37:5ae1:36f::1"
+	# Im Betrieb gehoert die Default-Route dem Tunnel, der Endpunkt liegt
+	# daran vorbei.
+	scen route_default_dev_after_up "wgtest0"
+	scen route_198.51.100.7 "eth0"
 }

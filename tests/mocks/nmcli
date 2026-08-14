@@ -102,12 +102,26 @@ connection)
 		if [ "$(scen hijack_on_up 0)" = "1" ]; then
 			printf '%s' "$IFACE" >"$SCEN/route_default_dev"
 		fi
+		# Im Full-Modus ist genau das der Normalfall. Der vorherige Wert wird
+		# gesichert, damit das Herunterfahren ihn wiederherstellen kann.
+		after="$(scen route_default_dev_after_up '')"
+		if [ -n "$after" ]; then
+			cp "$SCEN/route_default_dev" "$SCEN/route_default_dev_saved" 2>/dev/null || true
+			printf '%s' "$after" >"$SCEN/route_default_dev"
+		fi
 		exit 0
 		;;
 	down)
 		if [ "$(scen down_rc 0)" != "0" ]; then exit "$(scen down_rc 0)"; fi
 		printf '0' >"$SCEN/nm_active"
 		printf '0' >"$SCEN/link_exists"
+		# Beim Herunterfahren faellt die Default-Route auf den Uplink zurueck,
+		# so wie er vor dem Hochfahren war.
+		# ... aber nur, wenn es den Uplink ueberhaupt noch gibt.
+		if [ -r "$SCEN/route_default_dev_saved" ] &&
+			[ "$(scen uplink_state connected)" = "connected" ]; then
+			cp "$SCEN/route_default_dev_saved" "$SCEN/route_default_dev"
+		fi
 		exit 0
 		;;
 	modify)
@@ -118,6 +132,13 @@ connection)
 	;;
 device)
 	case "$sub" in
+	status | "")
+		cat "$SCEN/device_status" 2>/dev/null || {
+			printf 'eth0:%s\n' "$(scen uplink_state connected)"
+			if [ "$(scen link_exists 0)" = "1" ]; then printf '%s:connected\n' "$IFACE"; fi
+		}
+		exit 0
+		;;
 	disconnect)
 		if [ "$(scen dev_disconnect_rc 0)" != "0" ]; then exit "$(scen dev_disconnect_rc 0)"; fi
 		printf '0' >"$SCEN/nm_active"

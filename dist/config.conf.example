@@ -7,6 +7,19 @@
 # 'sudo wg-guard setup' fuellt die Pflichtangaben und die vom System
 # abhaengigen Werte automatisch aus.
 
+# ------------------------------------------------------------- Betriebsart --
+
+# split = der Tunnel erschliesst nur interne Netze. Faellt er aus, ist die
+#         Internetverbindung nicht betroffen.
+# full  = der gesamte Verkehr laeuft durch den Tunnel. Faellt er aus, ist der
+#         Rechner offline - wg-guard faehrt ihn dann herunter, damit die
+#         Internetverbindung zurueckkommt. Der Verkehr laeuft danach
+#         ungeschuetzt, bis der Tunnel wieder steht.
+#
+# Praktisch alle Sicherheitspruefungen kehren sich zwischen beiden Modi um.
+# 'wg-guard setup' erkennt die Betriebsart an den AllowedIPs.
+TUNNEL_MODE="split"
+
 # ---------------------------------------------------------- Pflichtangaben --
 
 # Name der NetworkManager-Verbindung, die ueberwacht wird.
@@ -16,6 +29,7 @@ NM_CONNECTION=""
 WG_INTERFACE=""
 
 # Interner Host, der per Ping geprueft wird (Stufe 4).
+# Im Full-Modus optional - dort traegt Stufe 6 die Pruefung.
 PING_HOST=""
 
 # Interner TCP-Dienst als Host:Port (Stufe 5). Leer = Stufe 5 deaktiviert.
@@ -23,6 +37,18 @@ TCP_HEALTH=""
 
 # Endpunkt-Hostname des Tunnels. Leer = aus der Peer-Konfiguration lesen.
 #ENDPOINT_HOST=""
+
+# ------------------------------------------- Nur im Full-Modus (Stufe 6) ----
+
+# Ziel ausserhalb des Tunnels. Ohne diese Pruefung gaelte ein Tunnel als
+# gesund, der zwar steht, hinter dem aber kein Internet mehr ist.
+#EXTERNAL_CHECK_HOST="1.1.1.1"
+#EXTERNAL_CHECK_TCP="1.1.1.1:443"
+
+# Nach einem harten Herunterfahren (ip link delete) die DNS-Konfiguration
+# auffrischen. Sonst kann die Namensaufloesung auf einen Server hinter dem
+# toten Tunnel zeigen. Fasst keine fremde Verbindung an.
+#RESTORE_DNS_AFTER_HARD_DOWN=yes
 
 # ------------------------------------------------------------- Intervalle --
 

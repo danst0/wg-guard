@@ -190,10 +190,14 @@ cmd_check() {
 		return 1
 	fi
 	say "  Datei:           $CONFIG_FILE"
+	say "  Betriebsart:     $TUNNEL_MODE$([ "$TUNNEL_MODE" = "full" ] && printf ' (aller Verkehr durch den Tunnel)' || printf ' (nur interne Netze durch den Tunnel)')"
 	say "  Verbindung:      $NM_CONNECTION"
 	say "  Interface:       $WG_INTERFACE"
 	say "  Ping-Ziel:       ${PING_HOST:-<keins>}"
 	say "  TCP-Ziel:        ${TCP_HEALTH:-<deaktiviert>}"
+	if is_full_tunnel; then
+		say "  Externes Ziel:   ${EXTERNAL_CHECK_HOST:-<keins>} / ${EXTERNAL_CHECK_TCP:-<keins>}"
+	fi
 
 	head_line "Preflight"
 	if ! is_root; then
@@ -205,7 +209,11 @@ cmd_check() {
 	head_line "Kaskade"
 	local rc
 	if stage0_network_ready; then
-		say "  [ok]   Stufe 0  Netz vorhanden, Default-Route liegt nicht am Tunnel."
+		if is_full_tunnel; then
+			say "  [ok]   Stufe 0  Es gibt einen Uplink unterhalb des Tunnels."
+		else
+			say "  [ok]   Stufe 0  Netz vorhanden, Default-Route liegt nicht am Tunnel."
+		fi
 	else
 		say "  [ruhe] Stufe 0  $STAGE_REASON"
 		say "         (Das ist kein Fehler – ohne Netz bleibt der Tunnel unten.)"
@@ -226,10 +234,14 @@ cmd_check() {
 	fi
 	say "  [ok]   Stufe 2  Tunnel ist aktiv."
 
-	if check_default_route_safe; then
-		say "  [ok]   Q1–Q3   Der Tunnel hat die Default-Route nicht uebernommen."
+	if check_routing_safe; then
+		if is_full_tunnel; then
+			say "  [ok]   Q1f/Q5  Der Verkehr laeuft durch den Tunnel, der Endpunkt daran vorbei."
+		else
+			say "  [ok]   Q1–Q3   Der Tunnel hat die Default-Route nicht uebernommen."
+		fi
 	else
-		say "  [FEHL] Q1–Q3   $SAFETY_REASON"
+		say "  [FEHL] Routen  $SAFETY_REASON"
 	fi
 
 	if stage3_handshake_quick; then
@@ -240,7 +252,9 @@ cmd_check() {
 
 	rc=0
 	stage4_ping || rc=$?
-	if [ "$rc" -eq 0 ]; then
+	if [ -z "$PING_HOST" ] || [ "$STAGE4_ENABLED" != "yes" ]; then
+		say "  [--]   Stufe 4  uebersprungen (kein internes Ping-Ziel konfiguriert)."
+	elif [ "$rc" -eq 0 ]; then
 		say "  [ok]   Stufe 4  $PING_HOST antwortet."
 	else
 		say "  [FEHL] Stufe 4  $STAGE_REASON"
@@ -248,10 +262,22 @@ cmd_check() {
 
 	rc=0
 	stage5_tcp || rc=$?
-	if [ "$rc" -eq 0 ]; then
-		say "  [ok]   Stufe 5  ${TCP_HEALTH:-<deaktiviert>} nimmt Verbindungen an."
+	if [ -z "$TCP_HEALTH" ]; then
+		say "  [--]   Stufe 5  uebersprungen (kein interner TCP-Dienst konfiguriert)."
+	elif [ "$rc" -eq 0 ]; then
+		say "  [ok]   Stufe 5  $TCP_HEALTH nimmt Verbindungen an."
 	else
 		say "  [FEHL] Stufe 5  $STAGE_REASON"
+	fi
+
+	if is_full_tunnel; then
+		rc=0
+		stage6_external || rc=$?
+		if [ "$rc" -eq 0 ]; then
+			say "  [ok]   Stufe 6  Durch den Tunnel kommt Internet an."
+		else
+			say "  [FEHL] Stufe 6  $STAGE_REASON"
+		fi
 	fi
 	return 0
 }
@@ -573,9 +599,40 @@ cmd_setup() {
 		if [ -n "$endpoint" ]; then config_set ENDPOINT_HOST "$endpoint"; fi
 	fi
 
-	# Ping-Ziel aus den AllowedIPs vorschlagen.
-	local suggestion="" ips first
+	# Betriebsart aus den AllowedIPs ableiten – daran haengt fast alles Weitere.
+	local suggestion="" ips first detected="split"
 	if ips="$(nm_allowed_ips)"; then
+		while IFS= read -r first; do
+			case "$first" in
+			0.0.0.0/0 | ::/0) detected="full" ;;
+			esac
+		done <<<"$ips"
+	fi
+
+	say ""
+	if [ "$detected" = "full" ]; then
+		say "Die AllowedIPs dieser Verbindung enthalten eine Default-Route:"
+		say "Es handelt sich um einen Full-Tunnel – der gesamte Verkehr laeuft hindurch."
+		say ""
+		say "Das ist eine andere Betriebsart mit gespiegelten Pruefungen. Wichtig zu"
+		say "wissen: Faellt die Gegenstelle aus, faehrt wg-guard den Tunnel herunter,"
+		say "damit der Rechner wieder online ist. Der Verkehr laeuft dann ungeschuetzt"
+		say "ueber das normale Netz, bis der Tunnel wieder steht."
+		if ask_yes_no "Soll wg-guard im Full-Modus arbeiten?" "j"; then
+			TUNNEL_MODE="full"
+		else
+			TUNNEL_MODE="split"
+			say "Hinweis: Im Split-Modus verweigert der Preflight das Hochfahren,"
+			say "solange die AllowedIPs eine Default-Route enthalten."
+		fi
+	else
+		say "Die AllowedIPs enthalten keine Default-Route – ein Split-Tunnel."
+		TUNNEL_MODE="split"
+	fi
+	config_set TUNNEL_MODE "$TUNNEL_MODE"
+
+	# Ping-Ziel aus den AllowedIPs vorschlagen.
+	if [ "$TUNNEL_MODE" = "split" ] && [ -n "${ips:-}" ]; then
 		while IFS= read -r first; do
 			case "$first" in
 			*:*) continue ;;
@@ -586,16 +643,34 @@ cmd_setup() {
 			esac
 		done <<<"$ips"
 	fi
-	say ""
-	say "Der interne Host wird per Ping geprueft (Stufe 4)."
-	PING_HOST="$(ask "Interner Ping-Host" "$suggestion")"
-	config_set PING_HOST "$PING_HOST"
 
 	say ""
-	say "Zusaetzlich wird ein interner TCP-Dienst geprueft (Stufe 5)."
-	say "Leer lassen, wenn es keinen gibt – dann endet die Kaskade bei Stufe 4."
-	TCP_HEALTH="$(ask "Interner TCP-Endpunkt als Host:Port" "${TCP_HEALTH:-}")"
-	config_set TCP_HEALTH "$TCP_HEALTH"
+	if [ "$TUNNEL_MODE" = "full" ]; then
+		say "Im Full-Modus wird geprueft, ob durch den Tunnel wirklich Internet"
+		say "ankommt. Ohne diese Pruefung gaelte ein Tunnel als gesund, der zwar"
+		say "steht, hinter dem aber nichts mehr ist."
+		EXTERNAL_CHECK_HOST="$(ask "Externes Ping-Ziel" "${EXTERNAL_CHECK_HOST:-1.1.1.1}")"
+		config_set EXTERNAL_CHECK_HOST "$EXTERNAL_CHECK_HOST"
+		EXTERNAL_CHECK_TCP="$(ask "Externes TCP-Ziel als Host:Port (leer = aus)" "${EXTERNAL_CHECK_TCP:-1.1.1.1:443}")"
+		config_set EXTERNAL_CHECK_TCP "$EXTERNAL_CHECK_TCP"
+		say ""
+		say "Zusaetzlich koennen interne Ziele geprueft werden. Leer lassen, wenn es"
+		say "keine gibt."
+		PING_HOST="$(ask "Interner Ping-Host (optional)" "")"
+		config_set PING_HOST "$PING_HOST"
+		TCP_HEALTH="$(ask "Interner TCP-Endpunkt als Host:Port (optional)" "")"
+		config_set TCP_HEALTH "$TCP_HEALTH"
+	else
+		say "Der interne Host wird per Ping geprueft (Stufe 4)."
+		PING_HOST="$(ask "Interner Ping-Host" "$suggestion")"
+		config_set PING_HOST "$PING_HOST"
+
+		say ""
+		say "Zusaetzlich wird ein interner TCP-Dienst geprueft (Stufe 5)."
+		say "Leer lassen, wenn es keinen gibt – dann endet die Kaskade bei Stufe 4."
+		TCP_HEALTH="$(ask "Interner TCP-Endpunkt als Host:Port" "${TCP_HEALTH:-}")"
+		config_set TCP_HEALTH "$TCP_HEALTH"
+	fi
 
 	setup_detect_capabilities
 

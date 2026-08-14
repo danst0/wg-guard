@@ -44,6 +44,25 @@ nm_list_wireguard_connections() {
 		done
 }
 
+# Ist ausser dem Tunnel noch ein Geraet verbunden?
+#
+# Im Full-Modus taugen Routen dafuer nicht als Kriterium – die Default-Route
+# gehoert dort im Betrieb dem Tunnel. Die Geraeteliste ist unabhaengig davon
+# und auch direkt nach einem Neustart des Daemons aussagekraeftig.
+nm_uplink_connected() {
+	local out dev state
+	out="$(run_timeout "$CMD_TIMEOUT" nmcli -t -f DEVICE,STATE device status 2>/dev/null)" || return 1
+	while IFS=: read -r dev state; do
+		if [ -z "$dev" ]; then continue; fi
+		if [ "$dev" = "$WG_INTERFACE" ]; then continue; fi
+		if [ "$dev" = "lo" ]; then continue; fi
+		case "$state" in
+		connected*) return 0 ;;
+		esac
+	done <<<"$out"
+	return 1
+}
+
 # NM-Gesamtzustand: gibt "STATE CONNECTIVITY" aus.
 nm_general_state() {
 	local out
@@ -190,22 +209,28 @@ preflight_run() {
 		preflight_add P1 fail "Verbindung \"$NM_CONNECTION\" ist vom Typ \"${ctype:-unbekannt}\", erwartet wird wireguard."
 	fi
 
-	# P2 – keine Default-Route aus dem Profil.
-	local v4nd v6nd
-	v4nd="$(nm_get ipv4.never-default)" || v4nd=""
-	v6nd="$(nm_get ipv6.never-default)" || v6nd=""
-	if [ "$v4nd" = "yes" ]; then
-		preflight_add P2 ok "ipv4.never-default ist gesetzt."
-	else
-		preflight_add P2 fail "ipv4.never-default ist \"${v4nd:-unbekannt}\", erwartet wird yes." \
-			"$nmcli_mod ipv4.never-default yes"
-	fi
-	if [ "$v6nd" = "yes" ]; then
-		preflight_add P2 ok "ipv6.never-default ist gesetzt."
-	else
-		preflight_add P2 fail "ipv6.never-default ist \"${v6nd:-unbekannt}\", erwartet wird yes." \
-			"$nmcli_mod ipv6.never-default yes"
-	fi
+	# P2 – Default-Route aus dem Profil. Die Erwartung kehrt sich um:
+	#      Beim Split-Tunnel darf sie nicht kommen, beim Full-Tunnel muss sie.
+	local nd key4 key6
+	for key4 in ipv4 ipv6; do
+		nd="$(nm_get "$key4.never-default")" || nd=""
+		if is_full_tunnel; then
+			if [ "$nd" = "no" ] || [ -z "$nd" ]; then
+				preflight_add P2 ok "$key4.never-default ist \"${nd:-no}\" – der Tunnel darf die Default-Route setzen."
+			else
+				preflight_add P2 fail "$key4.never-default ist \"$nd\". Im Full-Modus wuerde NetworkManager dann keine Peer-Route fuer 0.0.0.0/0 anlegen und der Tunnel bliebe funktionslos." \
+					"$nmcli_mod $key4.never-default no"
+			fi
+		else
+			if [ "$nd" = "yes" ]; then
+				preflight_add P2 ok "$key4.never-default ist gesetzt."
+			else
+				preflight_add P2 fail "$key4.never-default ist \"${nd:-unbekannt}\", erwartet wird yes." \
+					"$nmcli_mod $key4.never-default yes"
+			fi
+		fi
+	done
+	unset key6
 
 	# P3 – der Guard besitzt den Lebenszyklus allein.
 	local autoconn
@@ -226,37 +251,57 @@ preflight_run() {
 			0.0.0.0/0 | ::/0) has_default=1 ;;
 			esac
 		done <<<"$ips"
-		if [ "$has_default" -eq 1 ]; then
-			preflight_add P4 fail "AllowedIPs enthaelt eine Default-Route (0.0.0.0/0 oder ::/0). Das ist kein Split-Tunnel."
+		if is_full_tunnel; then
+			if [ "$has_default" -eq 1 ]; then
+				preflight_add P4 ok "AllowedIPs enthalten eine Default-Route – das ist im Full-Modus so gewollt."
+			else
+				preflight_add P4 fail "TUNNEL_MODE ist full, aber die AllowedIPs enthalten keine Default-Route ($(printf '%s' "$ips" | tr '\n' ' ')). Modus und Verbindung passen nicht zusammen."
+			fi
 		else
-			preflight_add P4 ok "AllowedIPs enthaelt keine Default-Route ($(printf '%s' "$ips" | tr '\n' ' '))."
+			if [ "$has_default" -eq 1 ]; then
+				preflight_add P4 fail "AllowedIPs enthaelt eine Default-Route (0.0.0.0/0 oder ::/0). Das ist kein Split-Tunnel. Wenn das so gewollt ist, gehoert TUNNEL_MODE auf full."
+			else
+				preflight_add P4 ok "AllowedIPs enthaelt keine Default-Route ($(printf '%s' "$ips" | tr '\n' ' '))."
+			fi
 		fi
 	else
 		preflight_add P4 fail "AllowedIPs konnten weder aus der Keyfile noch ueber nmcli ermittelt werden. Im Zweifel wird nicht hochgefahren."
 	fi
 
-	# P5 – kein DNS-Hijack. Eine negative dns-priority zieht die systemweite
-	#      Aufloesung an sich, auch ohne Default-Route.
+	# P5 – Namensaufloesung. Beim Split-Tunnel darf der Tunnel sie nicht
+	#      anfassen; beim Full-Tunnel ist genau das gewollt und wird nur
+	#      berichtet, damit man sieht, worauf DNS zeigt.
 	local key val prio
-	for key in ipv4.dns ipv6.dns ipv4.dns-search ipv6.dns-search; do
-		val="$(nm_get "$key")" || val=""
-		if [ -z "$val" ]; then
-			preflight_add P5 ok "$key ist leer."
-		else
-			preflight_add P5 fail "$key ist gesetzt (\"$val\"). Der Tunnel darf die Namensaufloesung nicht anfassen." \
-				"$nmcli_mod $key \"\""
-		fi
-	done
-	for key in ipv4.dns-priority ipv6.dns-priority; do
-		prio="$(nm_get "$key")" || prio=""
-		[ -n "$prio" ] || prio=0
-		if [ "$prio" -ge 0 ] 2>/dev/null; then
-			preflight_add P5 ok "$key ist $prio (nicht negativ)."
-		else
-			preflight_add P5 fail "$key ist $prio. Negative Werte kapern die systemweite Namensaufloesung." \
-				"$nmcli_mod $key 0"
-		fi
-	done
+	if is_full_tunnel; then
+		for key in ipv4.dns ipv6.dns; do
+			val="$(nm_get "$key")" || val=""
+			if [ -n "$val" ]; then
+				preflight_add P5 ok "$key ist \"$val\" – im Full-Modus uebernimmt der Tunnel die Namensaufloesung."
+			else
+				preflight_add P5 warn "$key ist leer. Im Full-Modus laeuft die Namensaufloesung dann ueber die Server des lokalen Netzes, obwohl aller Verkehr durch den Tunnel geht."
+			fi
+		done
+	else
+		for key in ipv4.dns ipv6.dns ipv4.dns-search ipv6.dns-search; do
+			val="$(nm_get "$key")" || val=""
+			if [ -z "$val" ]; then
+				preflight_add P5 ok "$key ist leer."
+			else
+				preflight_add P5 fail "$key ist gesetzt (\"$val\"). Der Tunnel darf die Namensaufloesung nicht anfassen." \
+					"$nmcli_mod $key \"\""
+			fi
+		done
+		for key in ipv4.dns-priority ipv6.dns-priority; do
+			prio="$(nm_get "$key")" || prio=""
+			[ -n "$prio" ] || prio=0
+			if [ "$prio" -ge 0 ] 2>/dev/null; then
+				preflight_add P5 ok "$key ist $prio (nicht negativ)."
+			else
+				preflight_add P5 fail "$key ist $prio. Negative Werte kapern die systemweite Namensaufloesung." \
+					"$nmcli_mod $key 0"
+			fi
+		done
+	fi
 
 	# P6 – ohne PersistentKeepalive erneuert sich der Handshake nicht von selbst.
 	local ka
@@ -277,6 +322,12 @@ preflight_run() {
 	# 0 aus, 1 erzwungen an), nicht als yes/no.
 	for key in wireguard.ip4-auto-default-route wireguard.ip6-auto-default-route; do
 		val="$(nm_get "$key")" || val=""
+		if is_full_tunnel; then
+			# Bei einem /0-Peer schaltet NetworkManager das Policy-Routing von
+			# sich aus ein; hier ist es kein Umgehungsversuch, sondern der Weg.
+			preflight_add P7 ok "$key ist \"${val:--1}\" – im Full-Modus unkritisch."
+			continue
+		fi
 		case "$val" in
 		"1" | "true" | "yes")
 			preflight_add P7 fail "$key ist erzwungen aktiviert und umgeht never-default." \
@@ -296,7 +347,9 @@ preflight_run() {
 	done
 
 	# P8 – Ueberlappung mit dem lokalen Netz wuerde das LAN blackholen.
-	if [ "$ALLOW_LAN_OVERLAP" = "yes" ]; then
+	if is_full_tunnel; then
+		preflight_add P8 ok "Ueberlappung im Full-Modus bedeutungslos – es geht ohnehin alles durch den Tunnel."
+	elif [ "$ALLOW_LAN_OVERLAP" = "yes" ]; then
 		preflight_add P8 warn "Ueberlappungspruefung ist per ALLOW_LAN_OVERLAP deaktiviert."
 	elif [ "$has_default" -eq 1 ]; then
 		# Eine Default-Route ueberlappt naturgemaess mit jedem lokalen Netz.

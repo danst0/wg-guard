@@ -222,6 +222,101 @@ check_default_route_safe() {
 	return 0
 }
 
+# Q1f/Q5 – die Spiegelung fuer den Full-Tunnel.
+#
+# Hier ist die Default-Route am Tunnel der Normalzustand; ihr Fehlen waere der
+# Fehler. Zusaetzlich darf die Route zum VPN-Endpunkt selbst niemals durch den
+# Tunnel laufen, sonst versucht er sich selbst zu tunneln.
+check_full_tunnel_routing() {
+	SAFETY_REASON=""
+	local dev
+
+	# Q1f – der Verkehr muss tatsaechlich im Tunnel landen.
+	dev="$(route_dev_for 1.1.1.1 2>/dev/null)" || dev=""
+	if [ -z "$dev" ]; then
+		SAFETY_REASON="Es laesst sich keine Default-Route ermitteln."
+		return 1
+	fi
+	if [ "$dev" != "$WG_INTERFACE" ]; then
+		SAFETY_REASON="Die Default-Route laeuft ueber $dev statt ueber $WG_INTERFACE – der Verkehr geht am Tunnel vorbei."
+		return 1
+	fi
+
+	# Q5 – Routenschleife zum Endpunkt ausschliessen.
+	local endpoint
+	endpoint="${RESOLVED_ENDPOINT_IP:-}"
+	if [ -n "$endpoint" ]; then
+		dev="$(route_dev_for "$endpoint" 2>/dev/null)" || dev=""
+		if [ -n "$dev" ] && [ "$dev" = "$WG_INTERFACE" ]; then
+			SAFETY_REASON="Die Route zum VPN-Endpunkt $endpoint laeuft durch den Tunnel selbst – das kann nicht funktionieren."
+			return 1
+		fi
+	fi
+
+	return 0
+}
+
+# Einstiegspunkt fuer beide Betriebsarten.
+check_routing_safe() {
+	if is_full_tunnel; then
+		check_full_tunnel_routing
+		return $?
+	fi
+	check_default_route_safe
+	return $?
+}
+
+# Gibt es einen nutzbaren Uplink unterhalb des Tunnels?
+#
+# Im Full-Modus taugt die Default-Route dafuer nicht als Kriterium – die gehoert
+# im Betrieb dem Tunnel. Gesucht ist ein Weg nach draussen an ihm vorbei:
+# entweder eine Default-Route ueber ein anderes Geraet oder eine Route zum
+# VPN-Endpunkt, die nicht durch den Tunnel laeuft.
+uplink_available() {
+	SAFETY_REASON=""
+	local out dev
+
+	# Verlaesslichstes Kriterium, weil unabhaengig von der Routenlage und auch
+	# direkt nach einem Neustart des Daemons gueltig.
+	if nm_uplink_connected; then
+		return 0
+	fi
+
+	out="$(run_timeout "$CMD_TIMEOUT" ip route show default 2>/dev/null || true)"
+	if printf '%s' "$out" | grep -q 'default' &&
+		printf '%s' "$out" | grep -qv "dev $WG_INTERFACE"; then
+		return 0
+	fi
+
+	if [ -n "${RESOLVED_ENDPOINT_IP:-}" ]; then
+		dev="$(route_dev_for "$RESOLVED_ENDPOINT_IP" 2>/dev/null)" || dev=""
+		if [ -n "$dev" ] && [ "$dev" != "$WG_INTERFACE" ]; then
+			return 0
+		fi
+	fi
+
+	SAFETY_REASON="Es ist kein Uplink erkennbar, der nicht durch den Tunnel laeuft."
+	return 1
+}
+
+# Nach dem Herunterfahren im Full-Modus: es muss wieder eine Default-Route
+# geben, die nicht am Tunnel haengt. Sonst waere der Rechner offline, und genau
+# das soll dieses Werkzeug verhindern.
+verify_uplink_restored() {
+	SAFETY_REASON=""
+	local out
+	out="$(run_timeout "$CMD_TIMEOUT" ip route show default 2>/dev/null || true)"
+	if [ -z "$out" ]; then
+		SAFETY_REASON="Nach dem Herunterfahren existiert keine Default-Route mehr."
+		return 1
+	fi
+	if ! printf '%s' "$out" | grep -qv "dev $WG_INTERFACE"; then
+		SAFETY_REASON="Die einzige Default-Route zeigt weiterhin auf $WG_INTERFACE."
+		return 1
+	fi
+	return 0
+}
+
 # Q4 – Laeuft der Pfad zum Prueffziel wirklich durch den Tunnel?
 check_probe_path() {
 	local target="$1" dev
@@ -264,6 +359,39 @@ tunnel_is_down() {
 	return 0
 }
 
+# Nach einem harten "ip link delete" weiss NetworkManager nichts vom
+# Verschwinden des Interfaces und nimmt seine DNS-Einstellungen unter Umstaenden
+# nicht zurueck. Beim Split-Tunnel ist das folgenlos; beim Full-Tunnel zeigt die
+# Namensaufloesung danach auf einen Server hinter dem toten Tunnel – fuer die
+# Nutzerin sieht das aus wie "Internet immer noch kaputt".
+#
+# Aufgefrischt wird ausschliesslich die DNS-Konfiguration, es wird keine fremde
+# Verbindung angefasst.
+restore_dns_after_hard_down() {
+	is_full_tunnel || return 0
+	[ "$RESTORE_DNS_AFTER_HARD_DOWN" = "yes" ] || return 0
+
+	log_info "Frische die DNS-Konfiguration auf, damit keine Reste des Tunnels zurueckbleiben."
+	if command -v resolvectl >/dev/null 2>&1; then
+		run_timeout "$CMD_TIMEOUT" resolvectl revert "$WG_INTERFACE" >/dev/null 2>&1 || true
+	fi
+	run_timeout "$CMD_TIMEOUT" nmcli general reload dns-full >/dev/null 2>&1 || true
+}
+
+# Nach dem Herunterfahren im Full-Modus pruefen, ob der Rechner wieder online
+# ist. Reparieren kann wg-guard das nicht, ohne fremde Verbindungen anzufassen –
+# aber es muss laut sagen, wenn etwas nicht stimmt.
+check_uplink_after_down() {
+	is_full_tunnel || return 0
+	if verify_uplink_restored; then
+		log_debug "Uplink nach dem Herunterfahren wiederhergestellt."
+		return 0
+	fi
+	log_error "Nach dem Herunterfahren ist der Rechner offline: $SAFETY_REASON"
+	log_error "Bitte die normale Netzwerkverbindung pruefen – wg-guard fasst fremde Verbindungen bewusst nicht an."
+	return 1
+}
+
 # ensure_down – faehrt den Tunnel definiert herunter und verifiziert das.
 #
 # Eskalation, weil ein fehlgeschlagenes nmcli sonst eine blosse Absichts-
@@ -288,6 +416,7 @@ ensure_down() {
 	fi
 	if tunnel_is_down; then
 		ST_TUNNEL="down"
+		check_uplink_after_down
 		return 0
 	fi
 
@@ -296,6 +425,7 @@ ensure_down() {
 	run_timeout "$NMCLI_DOWN_TIMEOUT" nmcli device disconnect "$WG_INTERFACE" >/dev/null 2>&1 || true
 	if tunnel_is_down; then
 		ST_TUNNEL="down"
+		check_uplink_after_down
 		return 0
 	fi
 
@@ -304,9 +434,11 @@ ensure_down() {
 	log_warn "Entferne das Interface $WG_INTERFACE direkt."
 	run_timeout "$CMD_TIMEOUT" ip link set "$WG_INTERFACE" down >/dev/null 2>&1 || true
 	run_timeout "$CMD_TIMEOUT" ip link delete "$WG_INTERFACE" >/dev/null 2>&1 || true
+	restore_dns_after_hard_down
 
 	if tunnel_is_down && ! tunnel_routes_exist; then
 		ST_TUNNEL="down"
+		check_uplink_after_down
 		return 0
 	fi
 

@@ -2,10 +2,14 @@
 
 Ein Watchdog für eine bestehende WireGuard-Verbindung unter NetworkManager.
 
-wg-guard richtet **keinen** Tunnel ein. Es überwacht einen vorhandenen
-Split-Tunnel und sorgt dafür, dass er nur dann oben ist, wenn kaskadiert
-nachgewiesen ist, dass er funktioniert. In jedem anderen Fall fährt es ihn
-herunter.
+wg-guard richtet **keinen** Tunnel ein. Es überwacht einen vorhandenen und
+sorgt dafür, dass er nur dann oben ist, wenn kaskadiert nachgewiesen ist, dass
+er funktioniert. In jedem anderen Fall fährt es ihn herunter.
+
+Es gibt zwei Betriebsarten, zwischen denen sich praktisch alle Prüfungen
+umkehren: **Split-Tunnel** (nur interne Netze laufen hindurch) und
+**Full-Tunnel** (aller Verkehr läuft hindurch). `wg-guard setup` erkennt an den
+AllowedIPs, welche vorliegt.
 
 Bedient wird das Ganze über einen einzigen Eintrag im Anwendungsmenü –
 „VPN pausieren / aktivieren". Ein Terminal ist im Alltag nicht nötig.
@@ -21,12 +25,14 @@ Hier ist es genau umgekehrt, und das ist Absicht:
 > Der Rechner darf unter keinen Umständen seine normale Internetverbindung
 > verlieren, weil der Tunnel Probleme hat.
 
-Der Tunnel erschließt nur interne Adressbereiche. Fällt er aus, ist das
-unangenehm – aber wenn dabei das Internet mit ausfällt, steht jemand ohne
-Arbeitsgerät und ohne Möglichkeit da, das selbst zu reparieren. Deshalb gilt
-durchgehend: **jeder unerwartete Zustand, jeder Fehler, jedes nicht
-interpretierbare Kommandoergebnis führt zum Herunterfahren des Tunnels.**
-Es gibt bewusst **keinen Kill-Switch**.
+Ein ausgefallener Tunnel ist unangenehm – aber wenn dabei das Internet mit
+ausfällt, steht jemand ohne Arbeitsgerät und ohne Möglichkeit da, das selbst zu
+reparieren. Deshalb gilt durchgehend: **jeder unerwartete Zustand, jeder
+Fehler, jedes nicht interpretierbare Kommandoergebnis führt zum Herunterfahren
+des Tunnels.** Es gibt bewusst **keinen Kill-Switch**.
+
+Wie weit das trägt, hängt von der Betriebsart ab — beim Split-Tunnel vollständig,
+beim Full-Tunnel nur eingeschränkt (siehe unten).
 
 Konkret heißt das:
 
@@ -35,10 +41,61 @@ Konkret heißt das:
   Routen, niemals iptables oder nftables.
 - Vor jedem Hochfahren läuft ein Preflight. Ist auch nur eine Invariante
   verletzt, wird nicht hochgefahren – und der Grund landet im Log.
-- Nach jedem Hochfahren und in jedem gesunden Zyklus wird geprüft, ob der
-  Tunnel die Default-Route an sich gezogen hat. Wenn ja: sofort herunter.
+- Nach jedem Hochfahren und in jedem gesunden Zyklus wird die Routenlage
+  geprüft. Im Split-Modus darf der Tunnel die Default-Route nicht an sich
+  ziehen; im Full-Modus muss er es. Weicht es ab: sofort herunter.
 - Ein unerwarteter Fehler im Programm selbst fährt den Tunnel herunter und
   beendet den Dienst. systemd startet ihn neu, und die Kaskade beginnt von vorn.
+
+## Die zwei Betriebsarten
+
+Beim **Split-Tunnel** ist der Tunnel ein Nebenweg. Fällt er aus, ist das
+unangenehm, aber das Internet bleibt. Hier *verhindert* fail-safe-down Schaden.
+
+Beim **Full-Tunnel** ist der Tunnel die Internetverbindung. Fällt die
+Gegenstelle aus, ist der Rechner offline — und da hilft nur eines: den toten
+Tunnel herunterfahren, damit die normale Verbindung zurückkommt. Aus
+fail-safe-down wird hier ein **Reparaturmechanismus**. Aus „darf nie ausfallen"
+wird allerdings „fällt höchstens kurz aus, dann repariert es sich selbst";
+mehr ist bauartbedingt nicht möglich.
+
+**Das musst du beim Full-Modus wissen:** Wenn wg-guard den toten Tunnel
+herunterfährt, läuft dein Verkehr anschließend ungeschützt und mit deiner
+echten IP über das normale Netz, bis der Tunnel wieder steht. Das ist eine
+bewusste Entscheidung zugunsten der Erreichbarkeit — wer das nicht will,
+braucht einen Kill-Switch, also das genaue Gegenteil dieses Werkzeugs.
+
+Was sich zwischen den Modi umkehrt:
+
+| | `TUNNEL_MODE=split` | `TUNNEL_MODE=full` |
+|---|---|---|
+| `never-default` | muss `yes` sein | muss `no` sein |
+| AllowedIPs | kein `0.0.0.0/0` | `0.0.0.0/0` wird erwartet |
+| DNS im Profil | muss leer sein | ist gewollt, wird nur berichtet |
+| Überlappung mit dem LAN | Fehler | bedeutungslos |
+| Default-Route am Tunnel | Sicherheitsverletzung → sofort herunter | Normalzustand; ihr Fehlen ist der Fehler |
+| Stufe 0 | Default-Route darf nicht am Tunnel hängen | prüft den Uplink darunter |
+| Stufe 6 | entfällt | prüft, ob durch den Tunnel wirklich Internet ankommt |
+
+Zwei Prüfungen gibt es nur im Full-Modus, weil sie dort die typischen
+Totalausfälle abfangen:
+
+- **Die Endpunkt-Route.** Bei `0.0.0.0/0` muss der Weg zum VPN-Endpunkt am
+  physischen Interface hängen. Läuft er durch den Tunnel, versucht der sich
+  selbst zu tunneln und nichts funktioniert mehr.
+- **Internet hinter dem Tunnel.** Ohne ein Ziel außerhalb (Vorgabe `1.1.1.1`)
+  würde ein Tunnel als gesund gelten, der zwar steht, hinter dem aber nichts
+  mehr ist — genau der Zustand, in dem jemand ratlos vor einem toten Rechner
+  sitzt.
+
+Und ein Detail beim Herunterfahren: Die harte Eskalationsstufe `ip link delete`
+ist beim Split-Tunnel folgenlos, beim Full-Tunnel aber heikel —
+NetworkManager bekommt davon nichts mit und lässt seine DNS-Einstellungen
+womöglich stehen. Dann wäre die Route repariert, aber die Namensauflösung zeigt
+weiter auf einen Server hinter dem toten Tunnel. Im Full-Modus frischt wg-guard
+deshalb anschließend die DNS-Konfiguration auf und prüft, ob wieder eine
+Default-Route abseits des Tunnels existiert. Fremde Verbindungen fasst es auch
+dabei nicht an; fehlt der Uplink, sagt es das laut ins Log.
 
 ## Installation
 
@@ -68,9 +125,10 @@ WireGuard-Verbindungen auf und leitet Interface und Endpunkt selbst ab.
 ### Was die Einrichtung fragt
 
 1. Welche WireGuard-Verbindung überwacht werden soll (Auswahl aus einer Liste).
-2. Welcher interne Host per Ping erreichbar sein muss – mit einem Vorschlag aus
-   den AllowedIPs.
-3. Welcher interne TCP-Dienst erreichbar sein muss (Host:Port, optional).
+2. Die Betriebsart – erkannt an den AllowedIPs, mit Erklärung und Rückfrage.
+3. Welche Ziele erreichbar sein müssen: im Split-Modus ein interner Host (mit
+   Vorschlag aus den AllowedIPs) und optional ein interner TCP-Dienst; im
+   Full-Modus zusätzlich ein Ziel außerhalb des Tunnels.
 4. Ob die gefundenen Preflight-Abweichungen behoben werden sollen – einzeln, mit
    Anzeige des genauen Kommandos. Es wird **nichts** stillschweigend geändert.
 5. Für welche Benutzerin der VPN-Schalter freigeschaltet wird.
@@ -116,8 +174,9 @@ Jede Stufe muss bestehen, bevor die nächste versucht wird:
 | 3 | Frischer WireGuard-Handshake | herunterfahren, Backoff |
 | 4 | Ping auf den internen Host, gebunden an das Tunnel-Interface | Toleranz, dann herunterfahren |
 | 5 | TCP-Verbindung zum internen Dienst | Toleranz, dann herunterfahren |
+| 6 | *nur Full-Modus:* kommt durch den Tunnel wirklich Internet an? | Toleranz, dann herunterfahren |
 
-Erst nach Stufe 5 gilt der Tunnel als gesund. Im gesunden Zustand wird seltener
+Erst nach der letzten Stufe gilt der Tunnel als gesund. Im gesunden Zustand wird seltener
 geprüft (Vorgabe: alle 60 s), im Fehlerzustand häufiger.
 
 Zwei Details, die in der Praxis den Unterschied machen:
@@ -147,6 +206,8 @@ tatsächlich geändert hat (Default-Gateway, Gerät, aktive Verbindung).
 ## Die Sicherheits-Invarianten im Einzelnen
 
 Der Preflight läuft vor **jedem** Hochfahren, nicht nur bei der Einrichtung.
+Die folgende Tabelle beschreibt den Split-Modus; im Full-Modus kehren sich
+P2, P4, P5, P7 und P8 um (siehe oben).
 
 | Code | Prüfung | Warum |
 |---|---|---|
@@ -193,6 +254,8 @@ Die wichtigsten Stellschrauben:
 
 | Schlüssel | Vorgabe | Bedeutung |
 |---|---|---|
+| `TUNNEL_MODE` | split | `split` oder `full` — bestimmt sämtliche Prüfungen |
+| `EXTERNAL_CHECK_HOST` | 1.1.1.1 | nur Full-Modus: Ziel für Stufe 6 |
 | `CHECK_INTERVAL_HEALTHY` | 60 | Prüfabstand, solange alles läuft |
 | `CHECK_INTERVAL_IDLE` | 15 | Prüfabstand im Ruhezustand |
 | `HEALTH_FAILURES_BEFORE_DOWN` | 2 | Toleranz für verlorene Pakete auf Stufe 4/5 |
@@ -284,6 +347,8 @@ wg-guard logs -f     # Mitlesen
 |---|---|
 | „Zustand: PREFLIGHT_FEHLER" | Die NM-Verbindung verletzt eine Invariante. `sudo wg-guard preflight --fix` zeigt jeden Punkt einzeln und fragt nach. |
 | Der Tunnel geht ständig auf und zu | `wg-guard logs` zeigt die scheiternde Stufe. Bei Stufe 4/5 hilft oft ein höheres `HEALTH_FAILURES_BEFORE_DOWN`. |
+| Full-Modus: ständig Stufe 6 | Der Tunnel steht, aber dahinter kommt nichts an. Meist ist die Gegenstelle halb tot. wg-guard fährt ihn herunter, damit du online bleibst. |
+| Nach dem Herunterfahren geht DNS nicht | Sollte der DNS-Refresh nicht greifen: `sudo nmcli general reload dns-full`. Bitte melden, das wäre ein Fehler. |
 | „Zustand: RUHE", obwohl Netz da ist | NetworkManager meldet `limited` oder `portal` – meist ein WLAN-Anmeldefenster. Das ist Absicht: hinter einer Anmeldeseite hätte ein Verbindungsversuch keine Aussicht. |
 | Stufe 3 scheitert dauerhaft | Die Gegenstelle antwortet nicht. Prüfen, ob der dynamische Hostname auf die richtige Adresse zeigt: `getent ahosts <hostname>`. |
 | Der Desktop-Schalter fragt nach einem Passwort | Die Gruppenmitgliedschaft ist noch nicht aktiv – einmal ab- und wieder anmelden. Sonst prüfen, ob `/etc/sudoers` die Zeile `@includedir /etc/sudoers.d` enthält. |
