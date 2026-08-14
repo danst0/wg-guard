@@ -47,6 +47,8 @@ SERVICE_NAME="wg-guard.service"
 # "curl ... | sudo bash" das Skript selbst.
 TTY_IN=""
 open_tty() {
+	# Ausdrueckliches Abschalten fuer Skripte und die Testsuite.
+	if [ -n "${WG_GUARD_NONINTERACTIVE:-}" ]; then return 1; fi
 	if [ -n "$TTY_IN" ]; then return 0; fi
 	if [ -r /dev/tty ]; then
 		TTY_IN="/dev/tty"
@@ -92,7 +94,13 @@ cmd_status() {
 	if [ ! -r "$STATE_FILE" ]; then
 		say "wg-guard: kein Zustand vorhanden."
 		if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
-			say "Der Dienst laeuft, hat aber noch nichts geschrieben. Bitte kurz warten."
+			say "Der Dienst laeuft, hat aber noch nichts geschrieben – direkt nach"
+			say "einem Start ist das normal. Bleibt es dabei:"
+			say "  wg-guard logs"
+			if ! config_is_complete; then
+				say ""
+				say "Vermutliche Ursache: $CONFIG_ERROR"
+			fi
 		else
 			say "Der Dienst laeuft nicht. Start mit: sudo systemctl start $SERVICE_NAME"
 		fi
@@ -702,6 +710,73 @@ cmd_setup() {
 	return 0
 }
 
+# --------------------------------------------------------------- migrate ----
+
+# Nach einem Update koennen Schluessel dazugekommen sein, deren Vorgabe das
+# Verhalten bestimmt. Ein blosser Hinweis "Vorgaben greifen automatisch" reicht
+# dann nicht: TUNNEL_MODE=split ist fuer einen Full-Tunnel schlicht falsch und
+# der Preflight blockiert das Hochfahren, ohne dass klar waere, warum.
+cmd_migrate() {
+	require_root
+
+	if grep -qE '^[[:space:]]*TUNNEL_MODE=' "$CONFIG_FILE" 2>/dev/null; then
+		say "Die Konfiguration ist auf dem Stand dieser Version."
+		return 0
+	fi
+
+	# Betriebsart aus den AllowedIPs ableiten.
+	local detected="split" ips first
+	if ips="$(nm_allowed_ips 2>/dev/null)"; then
+		while IFS= read -r first; do
+			case "$first" in
+			0.0.0.0/0 | ::/0) detected="full" ;;
+			esac
+		done <<<"$ips"
+	fi
+
+	if [ "$detected" != "full" ]; then
+		# Split ist die Vorgabe; einfach festschreiben, damit es explizit ist.
+		config_set TUNNEL_MODE "split"
+		say "Betriebsart split in die Konfiguration eingetragen."
+		return 0
+	fi
+
+	say ""
+	say "Diese Version unterscheidet zwischen Split- und Full-Tunnel."
+	say "Die Verbindung \"$NM_CONNECTION\" leitet laut ihren AllowedIPs den"
+	say "gesamten Verkehr durch den Tunnel – das ist ein Full-Tunnel."
+	say ""
+	say "Ohne diese Angabe wuerde wg-guard sie als Split-Tunnel behandeln und"
+	say "das Hochfahren verweigern."
+	say ""
+	say "Wichtig: Im Full-Modus faehrt wg-guard den Tunnel herunter, wenn die"
+	say "Gegenstelle ausfaellt – damit der Rechner wieder online ist. Der Verkehr"
+	say "laeuft dann ungeschuetzt ueber das normale Netz, bis der Tunnel steht."
+	say ""
+
+	if ! interactive; then
+		say "Kein Terminal verfuegbar. Bitte nachtragen:"
+		say "  sudo wg-guard migrate"
+		return 1
+	fi
+
+	if ask_yes_no "Soll wg-guard diese Verbindung im Full-Modus ueberwachen?" "j"; then
+		config_set TUNNEL_MODE "full"
+		[ -n "${EXTERNAL_CHECK_HOST:-}" ] || EXTERNAL_CHECK_HOST="1.1.1.1"
+		EXTERNAL_CHECK_HOST="$(ask "Externes Ping-Ziel fuer Stufe 6" "$EXTERNAL_CHECK_HOST")"
+		config_set EXTERNAL_CHECK_HOST "$EXTERNAL_CHECK_HOST"
+		say "Betriebsart full eingetragen."
+	else
+		config_set TUNNEL_MODE "split"
+		say "Betriebsart split eingetragen. Der Preflight wird das Hochfahren"
+		say "verweigern, solange die AllowedIPs eine Default-Route enthalten."
+	fi
+
+	say ""
+	say "Naechster Schritt: sudo wg-guard preflight --fix"
+	return 0
+}
+
 # ---------------------------------------------------------------- update ----
 
 cmd_update() {
@@ -729,6 +804,7 @@ Aufruf: wg-guard <befehl>
   resume              Pause aufheben
   logs [-f]           Protokoll aus journald
   setup               Interaktive Ersteinrichtung
+  migrate             Nach einem Update fehlende Angaben ergaenzen
   preflight [--fix]   Sicherheitspruefung der NM-Verbindung
   update [--check]    Auf eine neue Version pruefen und aktualisieren
   version             Version anzeigen
@@ -747,6 +823,7 @@ main() {
 	resume) cmd_resume "$@" ;;
 	logs) cmd_logs "$@" ;;
 	setup) cmd_setup "$@" ;;
+	migrate) cmd_migrate "$@" ;;
 	preflight) cmd_preflight "$@" ;;
 	update) cmd_update "$@" ;;
 	version) say "wg-guard $WG_GUARD_VERSION" ;;

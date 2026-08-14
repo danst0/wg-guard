@@ -156,6 +156,7 @@ automatisch weiter versucht."). Die Pause überlebt einen Neustart.
 | `wg-guard logs [-f]` | Protokoll aus journald |
 | `wg-guard preflight [--fix]` | Sicherheitsprüfung der NM-Verbindung, optional mit Rückfrage reparieren |
 | `wg-guard setup` | Einrichtung erneut durchlaufen |
+| `wg-guard migrate` | nach einem Update fehlende Angaben ergänzen |
 | `wg-guard update [--check]` | Auf eine neue Version prüfen und aktualisieren |
 
 `status` und `check` funktionieren ohne root; `check` ist ohne root nur
@@ -353,6 +354,7 @@ wg-guard logs -f     # Mitlesen
 | Stufe 3 scheitert dauerhaft | Die Gegenstelle antwortet nicht. Prüfen, ob der dynamische Hostname auf die richtige Adresse zeigt: `getent ahosts <hostname>`. |
 | Der Desktop-Schalter fragt nach einem Passwort | Die Gruppenmitgliedschaft ist noch nicht aktiv – einmal ab- und wieder anmelden. Sonst prüfen, ob `/etc/sudoers` die Zeile `@includedir /etc/sudoers.d` enthält. |
 | Der Schalter meldet „Berechtigung fehlt" | Dasselbe; zusätzlich prüfen, ob `/usr/local/bin` im `secure_path` von sudo steht. |
+| Nach einem Update blockt der Preflight plötzlich | Vermutlich hat das Update einen Schlüssel eingeführt, den die alte Konfiguration nicht kennt. `sudo wg-guard migrate` trägt ihn nach. Der Installer ruft das selbst auf, wenn ein Terminal da ist. |
 | Nach einem Update ist alles wie vorher | Der Dienst kam nicht sauber hoch und es wurde automatisch zurückgerollt. `journalctl -u wg-guard-update` zeigt den Grund. |
 
 Das Protokoll geht nach journald und ist im Normalbetrieb still. Für mehr

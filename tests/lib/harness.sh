@@ -146,7 +146,8 @@ daemon_env() {
 		"MOCK_LOG=$MOCK_LOG" \
 		"FAKE_TIME_FILE=$FAKE_TIME_FILE" \
 		"WG_GUARD_FAKE_TIME_FILE=$FAKE_TIME_FILE" \
-		"WG_GUARD_LOG_PLAIN=1"
+		"WG_GUARD_LOG_PLAIN=1" \
+		"WG_GUARD_NONINTERACTIVE=1"
 }
 
 # run_daemon [zyklen] – laesst den Daemon eine begrenzte Zahl Schleifen laufen.

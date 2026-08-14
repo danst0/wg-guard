@@ -253,7 +253,9 @@ EOF
 		done < <(grep -oE '^#?[A-Z_]+=' "$SRCDIR/dist/config.conf.example" | tr -d '#=' | sort -u)
 		if [ "${#new[@]}" -gt 0 ]; then
 			say "  Neue Konfigurationsschluessel in dieser Version: ${new[*]}"
-			say "  (Vorgaben greifen automatisch, eine Aenderung ist nicht noetig.)"
+			# Bewusst kein "Vorgaben greifen automatisch": TUNNEL_MODE bestimmt
+			# das gesamte Verhalten, und die Vorgabe passt nicht zu jeder
+			# Verbindung. Darum kuemmert sich 'wg-guard migrate'.
 		fi
 	}
 
@@ -358,9 +360,11 @@ EOF
 			return 0
 		fi
 
-		# Bereits eingerichtet? Dann nicht ungefragt durch das Setup laufen.
+		# Bereits eingerichtet? Dann nicht ungefragt durch das Setup laufen –
+		# aber pruefen, ob dieses Update Angaben braucht, die noch fehlen.
 		if grep -qE '^[[:space:]]*NM_CONNECTION="[^"]+"' "$SYSCONFDIR/wg-guard/config.conf" 2>/dev/null; then
 			say "Die Konfiguration ist bereits ausgefuellt – das Setup wird uebersprungen."
+			"$PREFIX/bin/wg-guard" migrate || true
 			systemctl restart wg-guard.service 2>/dev/null || true
 			say ""
 			"$PREFIX/bin/wg-guard" status || true
