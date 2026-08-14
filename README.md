@@ -284,7 +284,11 @@ absichtlich misstrauisch:
    Release darf den laufenden Watchdog nie ersetzen.
 3. Die aktuelle Installation sichern.
 4. Installieren, Dienst neu starten.
-5. Läuft der Dienst danach nicht sauber, wird **automatisch zurückgerollt**.
+5. Läuft der Dienst danach nicht sauber, wird **automatisch zurückgerollt** —
+   es sei denn, er scheitert an der *Konfiguration* statt am Code. Dann bleibt
+   das Update installiert und der Grund wird genannt: Ein Rollback würde nichts
+   lösen, weil die alte Version denselben Fehler hat und ihn nur später und
+   unverständlicher meldet.
 
 Der kurze Neustart trennt den Tunnel; er wird anschließend über die volle
 Kaskade neu aufgebaut. Eine aktive Pause überlebt das Update.

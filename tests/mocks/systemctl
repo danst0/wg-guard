@@ -5,6 +5,10 @@ printf 'systemctl %s\n' "$*" >>"$MOCK_LOG"
 scen() { cat "$SCEN/$1" 2>/dev/null || printf '%s' "${2:-}"; }
 
 case "${1:-}" in
+show)
+	printf '%s\n' "$(scen exec_main_status 0)"
+	exit 0
+	;;
 is-active) exit "$(scen service_active_rc 0)" ;;
 restart | reload-or-restart)
 	# Ein erfolgreicher Neustart aktualisiert die Zustandsdatei, genau wie es

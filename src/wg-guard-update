@@ -131,6 +131,19 @@ service_healthy_after_restart() {
 	systemctl is-active --quiet "$SERVICE_NAME"
 }
 
+# Scheitert der Dienst an der Konfiguration und nicht am Code, waere ein
+# Rollback falsch: die alte Version hat denselben Fehler, meldet ihn nur
+# spaeter und unverstaendlicher. Zurueckgerollt wird ausschliesslich kaputter
+# Code.
+service_failed_on_config() {
+	local st code
+	st="$(state_read STATE 2>/dev/null || printf '')"
+	if [ "$st" = "KONFIG_FEHLER" ]; then return 0; fi
+	code="$(systemctl show -p ExecMainStatus --value "$SERVICE_NAME" 2>/dev/null || printf '')"
+	if [ "$code" = "78" ]; then return 0; fi
+	return 1
+}
+
 # ------------------------------------------------------------- Hauptlauf ----
 
 do_update() {
@@ -260,6 +273,17 @@ do_update() {
 	fi
 
 	if ! service_healthy_after_restart; then
+		if service_failed_on_config; then
+			local reason
+			reason="$(state_read LAST_FAIL_REASON 2>/dev/null || printf '')"
+			log_error "Die neue Version $remote_version laeuft nicht, weil die Konfiguration fehlerhaft ist."
+			[ -n "$reason" ] && log_error "$reason"
+			log_error "Das Update bleibt installiert – ein Rollback wuerde nichts loesen, weil die alte Version denselben Fehler hat."
+			printf 'wg-guard wurde auf %s aktualisiert, startet aber nicht:\n' "$remote_version" >&2
+			[ -n "$reason" ] && printf '  %s\n' "$reason" >&2
+			printf 'Nach dem Korrigieren: sudo systemctl start %s\n' "$SERVICE_NAME" >&2
+			return 1
+		fi
 		log_error "Der Dienst laeuft nach dem Update nicht sauber. Rollback auf $WG_GUARD_VERSION."
 		restore_backup "$backup" || true
 		systemctl daemon-reload || true
