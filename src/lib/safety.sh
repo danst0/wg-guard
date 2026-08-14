@@ -348,6 +348,25 @@ verify_uplink_restored() {
 	return 0
 }
 
+# Erste Adresse zu einem Namen. IP-Literale werden unveraendert
+# durchgereicht.
+#
+# Die Aufloesung passiert bewusst hier und nicht in "ip route get": das
+# ueberlaesst iproute2 die Namensaufloesung, deren Verhalten bei gemischten
+# A/AAAA-Antworten von der Adressfamilie abhaengt – und macht aus einem
+# DNS-Problem eine Meldung ueber fehlende Routen.
+resolve_first_address() {
+	local host="$1" out
+	if is_ip_literal "$host"; then
+		printf '%s' "$host"
+		return 0
+	fi
+	out="$(run_timeout "$DNS_TIMEOUT" getent ahosts "$host" 2>/dev/null)" || return 1
+	out="$(printf '%s' "$out" | awk 'NF{print $1; exit}')"
+	[ -n "$out" ] || return 1
+	printf '%s' "$out"
+}
+
 # Q4 – Laeuft der Pfad zum Prueffziel wirklich durch den Tunnel?
 check_probe_path() {
 	local target="$1" dev

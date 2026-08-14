@@ -241,8 +241,13 @@ stage4_ping() {
 		return 1
 	fi
 
+	local target
+	if ! target="$(resolve_first_address "$PING_HOST")"; then
+		STAGE_REASON="Der Name $PING_HOST laesst sich nicht aufloesen."
+		return 1
+	fi
 	# Q4 – der Pfad muss durch den Tunnel laufen, sonst testen wir das LAN.
-	if ! check_probe_path "$PING_HOST"; then
+	if ! check_probe_path "$target"; then
 		STAGE_REASON="$SAFETY_REASON"
 		return 3
 	fi
@@ -266,17 +271,22 @@ stage5_tcp() {
 		return 0
 	}
 
-	local host port
+	local host port addr
 	read -r host port <<<"$(tcp_split_host "$TCP_HEALTH")"
 	if [ -z "$host" ] || [ -z "$port" ]; then
 		STAGE_REASON="TCP_HEALTH=\"$TCP_HEALTH\" ist kein gueltiges Host:Port."
 		return 1
 	fi
 
-	if ! check_probe_path "$host"; then
+	if ! addr="$(resolve_first_address "$host")"; then
+		STAGE_REASON="Der Name $host laesst sich nicht aufloesen."
+		return 1
+	fi
+	if ! check_probe_path "$addr"; then
 		STAGE_REASON="$SAFETY_REASON"
 		return 3
 	fi
+	host="$addr"
 
 	if [ "$TCP_METHOD" = "nc" ]; then
 		if run_timeout "$((TCP_TIMEOUT + 2))" nc -z -w "$TCP_TIMEOUT" "$host" "$port" >/dev/null 2>&1; then
@@ -303,10 +313,15 @@ stage6_external() {
 
 	local host port rc=0
 
+	local target
 	if [ -n "$EXTERNAL_CHECK_HOST" ]; then
+		if ! target="$(resolve_first_address "$EXTERNAL_CHECK_HOST")"; then
+			STAGE_REASON="Der Name $EXTERNAL_CHECK_HOST laesst sich nicht aufloesen."
+			return 1
+		fi
 		# Der Weg dorthin muss durch den Tunnel fuehren, sonst pruefen wir den
 		# Uplink statt des Tunnels.
-		if ! check_probe_path "$EXTERNAL_CHECK_HOST"; then
+		if ! check_probe_path "$target"; then
 			STAGE_REASON="$SAFETY_REASON"
 			return 3
 		fi
@@ -327,10 +342,15 @@ stage6_external() {
 			STAGE_REASON="EXTERNAL_CHECK_TCP=\"$EXTERNAL_CHECK_TCP\" ist kein gueltiges Host:Port."
 			return 1
 		fi
-		if ! check_probe_path "$host"; then
+		if ! target="$(resolve_first_address "$host")"; then
+			STAGE_REASON="Der Name $host laesst sich nicht aufloesen."
+			return 1
+		fi
+		if ! check_probe_path "$target"; then
 			STAGE_REASON="$SAFETY_REASON"
 			return 3
 		fi
+		host="$target"
 		if [ "$TCP_METHOD" = "nc" ]; then
 			run_timeout "$((TCP_TIMEOUT + 2))" nc -z -w "$TCP_TIMEOUT" "$host" "$port" >/dev/null 2>&1 || rc=$?
 		else

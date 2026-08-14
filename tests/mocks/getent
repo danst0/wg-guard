@@ -6,6 +6,11 @@ scen() { cat "$SCEN/$1" 2>/dev/null || printf '%s' "${2:-}"; }
 case "${1:-}" in
 ahosts|hosts)
 	if [ "$(scen dns_rc 0)" != "0" ]; then exit "$(scen dns_rc 0)"; fi
+	# Zielabhaengige Antwort, damit Tests verschiedene Namen abbilden koennen.
+	if [ -r "$SCEN/dns_${2:-}" ]; then
+		printf '%s STREAM %s\n' "$(cat "$SCEN/dns_${2:-}")" "${2:-host}"
+		exit 0
+	fi
 	printf '%s STREAM %s\n' "$(scen endpoint_ip '198.51.100.7')" "${2:-host}"
 	exit 0
 	;;
