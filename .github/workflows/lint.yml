@@ -1,0 +1,16 @@
+name: Pruefung
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Werkzeuge installieren
+        run: sudo apt-get update && sudo apt-get install -y shellcheck desktop-file-utils
+      - name: Syntax, shellcheck, Tests und Systemdateien pruefen
+        run: make check
