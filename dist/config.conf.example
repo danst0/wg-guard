@@ -32,7 +32,10 @@ WG_INTERFACE=""
 # Im Full-Modus optional - dort traegt Stufe 6 die Pruefung.
 PING_HOST=""
 
-# Interner TCP-Dienst als Host:Port (Stufe 5). Leer = Stufe 5 deaktiviert.
+# Interner TCP-Dienst (Stufe 5). Leer = Stufe 5 deaktiviert.
+# Erlaubt sind Host:Port (10.0.41.1:443), [IPv6]:Port und URLs mit bekanntem
+# Schema (https://host wird zu host:443). Geprueft wird eine TCP-Verbindung –
+# kein HTTP-Abruf, ein Pfadanteil wird deshalb ignoriert.
 TCP_HEALTH=""
 
 # Endpunkt-Hostname des Tunnels. Leer = aus der Peer-Konfiguration lesen.

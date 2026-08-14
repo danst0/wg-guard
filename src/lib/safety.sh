@@ -357,7 +357,14 @@ check_probe_path() {
 	*) dev="$(route_dev_for "$target" 2>/dev/null)" || dev="" ;;
 	esac
 	if [ -z "$dev" ]; then
-		SAFETY_REASON="Fuer $target laesst sich keine Route ermitteln."
+		# Zwischen "Name unbekannt" und "kein Weg dorthin" unterscheiden – das
+		# sind voellig verschiedene Ursachen.
+		if ! is_ip_literal "$target" &&
+			! run_timeout "$DNS_TIMEOUT" getent ahosts "$target" >/dev/null 2>&1; then
+			SAFETY_REASON="Der Name $target laesst sich nicht aufloesen."
+		else
+			SAFETY_REASON="Fuer $target laesst sich keine Route ermitteln."
+		fi
 		return 1
 	fi
 	if [ "$dev" != "$WG_INTERFACE" ]; then

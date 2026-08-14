@@ -226,7 +226,13 @@ cmd_check() {
 	say "  Verbindung:      $NM_CONNECTION"
 	say "  Interface:       $WG_INTERFACE"
 	say "  Ping-Ziel:       ${PING_HOST:-<keins>}"
-	say "  TCP-Ziel:        ${TCP_HEALTH:-<deaktiviert>}"
+	if [ -n "$TCP_HEALTH" ]; then
+		local _h _p
+		read -r _h _p <<<"$(tcp_split_host "$TCP_HEALTH")"
+		say "  TCP-Ziel:        $TCP_HEALTH -> TCP-Verbindung zu $_h:$_p"
+	else
+		say "  TCP-Ziel:        <deaktiviert>"
+	fi
 	if is_full_tunnel; then
 		say "  Externes Ziel:   ${EXTERNAL_CHECK_HOST:-<keins>} / ${EXTERNAL_CHECK_TCP:-<keins>}"
 	fi

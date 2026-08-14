@@ -270,20 +270,59 @@ config_is_complete() {
 
 is_full_tunnel() { [ "$TUNNEL_MODE" = "full" ]; }
 
-# Zerlegt "Host:Port" bzw. "[IPv6]:Port" in "host port".
+# Zerlegt eine Zieladresse in "host port".
+#
+# Versteht neben "Host:Port" und "[IPv6]:Port" auch URLs: aus
+# "https://m.dumke.me" wird "m.dumke.me 443". Ein Pfadanteil wird verworfen –
+# geprueft wird eine TCP-Verbindung, kein HTTP-Abruf.
 tcp_split_host() {
-	local spec="$1" host port
+	local spec="$1" host port="" scheme=""
+
+	case "$spec" in
+	*://*)
+		scheme="${spec%%://*}"
+		spec="${spec#*://}"
+		;;
+	esac
+	# Zugangsdaten, Pfad, Query und Fragment abschneiden.
+	spec="${spec##*@}"
+	spec="${spec%%/*}"
+	spec="${spec%%\?*}"
+	spec="${spec%%#*}"
+
 	case "$spec" in
 	\[*\]:*)
 		host="${spec%%]*}"
 		host="${host#[}"
 		port="${spec##*:}"
 		;;
-	*)
+	\[*\])
+		host="${spec#[}"
+		host="${host%]}"
+		;;
+	*:*:*)
+		# Nacktes IPv6 ohne Klammern hat keinen Port.
+		host="$spec"
+		;;
+	*:*)
 		host="${spec%:*}"
 		port="${spec##*:}"
 		;;
+	*)
+		host="$spec"
+		;;
 	esac
+
+	if [ -z "$port" ]; then
+		case "$scheme" in
+		https | wss) port=443 ;;
+		http | ws) port=80 ;;
+		ssh) port=22 ;;
+		imaps) port=993 ;;
+		smtps) port=465 ;;
+		esac
+	fi
+
 	printf '%s %s' "$host" "$port"
 }
 
@@ -297,20 +336,13 @@ validate_host_port() {
 	SPEC_ERROR=""
 	[ -n "$spec" ] || return 0 # leer heisst deaktiviert
 
-	case "$spec" in
-	*://*)
-		SPEC_ERROR="$name=\"$spec\" sieht aus wie eine URL. Erwartet wird Host:Port, zum Beispiel 10.0.41.1:443."
-		return 1
-		;;
-	*/*)
-		SPEC_ERROR="$name=\"$spec\" enthaelt einen Pfad. Erwartet wird Host:Port, zum Beispiel 10.0.41.1:443."
-		return 1
-		;;
-	esac
-
 	read -r host port <<<"$(tcp_split_host "$spec")"
-	if [ -z "$host" ] || [ -z "$port" ] || [ "$host" = "$spec" ]; then
-		SPEC_ERROR="$name=\"$spec\" ist kein gueltiges Host:Port."
+	if [ -z "$host" ]; then
+		SPEC_ERROR="$name=\"$spec\" enthaelt keinen Host."
+		return 1
+	fi
+	if [ -z "$port" ]; then
+		SPEC_ERROR="$name=\"$spec\" nennt keinen Port. Erwartet wird Host:Port (10.0.41.1:443) oder eine URL mit bekanntem Schema (https://host)."
 		return 1
 	fi
 	case "$port" in

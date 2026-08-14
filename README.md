@@ -184,6 +184,11 @@ Jede Stufe muss bestehen, bevor die nächste versucht wird:
 Erst nach der letzten Stufe gilt der Tunnel als gesund. Im gesunden Zustand wird seltener
 geprüft (Vorgabe: alle 60 s), im Fehlerzustand häufiger.
 
+Die Zielangaben für die Stufen 5 und 6 verstehen `Host:Port`, `[IPv6]:Port`
+und URLs mit bekanntem Schema — `https://m.dumke.me` wird zu `m.dumke.me:443`.
+Geprüft wird eine TCP-Verbindung, kein HTTP-Abruf; ein Pfadanteil wird deshalb
+verworfen. `wg-guard check` zeigt, was tatsächlich geprüft wird.
+
 Zwei Details, die in der Praxis den Unterschied machen:
 
 - **Stufe 3 wartet nicht passiv.** Ein WireGuard-Handshake erneuert sich nur bei
