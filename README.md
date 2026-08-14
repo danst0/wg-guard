@@ -82,7 +82,11 @@ Totalausfälle abfangen:
 
 - **Die Endpunkt-Route.** Bei `0.0.0.0/0` muss der Weg zum VPN-Endpunkt am
   physischen Interface hängen. Läuft er durch den Tunnel, versucht der sich
-  selbst zu tunneln und nichts funktioniert mehr.
+  selbst zu tunneln und nichts funktioniert mehr. Geprüft wird das mit der
+  Firewall-Markierung, die WireGuard seinen eigenen Paketen gibt — ohne sie
+  zeigt `ip route get` bei einem Full-Tunnel für *jede* Adresse auf den Tunnel,
+  auch für den Endpunkt, und ein völlig gesunder Tunnel sähe aus wie eine
+  Routenschleife.
 - **Internet hinter dem Tunnel.** Ohne ein Ziel außerhalb (Vorgabe `1.1.1.1`)
   würde ein Tunnel als gesund gelten, der zwar steht, hinter dem aber nichts
   mehr ist — genau der Zustand, in dem jemand ratlos vor einem toten Rechner

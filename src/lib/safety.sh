@@ -222,6 +222,37 @@ check_default_route_safe() {
 	return 0
 }
 
+# Die Firewall-Markierung, mit der WireGuard seine eigenen Pakete kennzeichnet.
+# NetworkManager vergibt sie bei einem Peer mit Default-Route automatisch und
+# haelt die Tunnelpakete damit ueber Policy-Routing aus dem Tunnel heraus.
+wg_fwmark() {
+	local out
+	out="$(run_timeout "$CMD_TIMEOUT" wg show "$WG_INTERFACE" fwmark 2>/dev/null)" || return 1
+	case "$out" in
+	off | "" | 0 | 0x0) return 1 ;;
+	esac
+	printf '%s' "$out"
+}
+
+# Ueber welches Geraet erreicht der Tunnel selbst seinen Endpunkt?
+#
+# Ohne die Markierung ist die Frage nicht sinnvoll zu beantworten: bei einem
+# Full-Tunnel zeigt "ip route get" fuer jede Adresse auf den Tunnel, auch fuer
+# den Endpunkt. Die echten WireGuard-Pakete tragen aber die fwmark und werden
+# an der Tunneltabelle vorbeigeleitet. Wer das ignoriert, haelt einen voellig
+# gesunden Full-Tunnel faelschlich fuer eine Routenschleife.
+endpoint_route_dev() {
+	local target="$1" mark out
+	if mark="$(wg_fwmark)"; then
+		out="$(run_timeout "$CMD_TIMEOUT" ip route get "$target" mark "$mark" 2>/dev/null)" || out=""
+		if [ -n "$out" ]; then
+			printf '%s' "$out" | sed -n 's/.*[[:space:]]dev[[:space:]]\+\([^[:space:]]\+\).*/\1/p' | head -n1
+			return 0
+		fi
+	fi
+	route_dev_for "$target"
+}
+
 # Q1f/Q5 – die Spiegelung fuer den Full-Tunnel.
 #
 # Hier ist die Default-Route am Tunnel der Normalzustand; ihr Fehlen waere der
@@ -246,7 +277,7 @@ check_full_tunnel_routing() {
 	local endpoint
 	endpoint="${RESOLVED_ENDPOINT_IP:-}"
 	if [ -n "$endpoint" ]; then
-		dev="$(route_dev_for "$endpoint" 2>/dev/null)" || dev=""
+		dev="$(endpoint_route_dev "$endpoint")" || dev=""
 		if [ -n "$dev" ] && [ "$dev" = "$WG_INTERFACE" ]; then
 			SAFETY_REASON="Die Route zum VPN-Endpunkt $endpoint laeuft durch den Tunnel selbst – das kann nicht funktionieren."
 			return 1

@@ -4,6 +4,11 @@ set -uo pipefail
 printf 'wg %s\n' "$*" >>"$MOCK_LOG"
 scen() { cat "$SCEN/$1" 2>/dev/null || printf '%s' "${2:-}"; }
 
+if [ "${1:-}" = "show" ] && [ "${3:-}" = "fwmark" ]; then
+	printf '%s\n' "$(scen fwmark off)"
+	exit 0
+fi
+
 if [ "${1:-}" = "show" ] && [ "${3:-}" = "latest-handshakes" ]; then
 	if [ "$(scen link_exists 0)" != "1" ]; then
 		printf 'Unable to access interface: No such device\n' >&2

@@ -41,6 +41,14 @@ route)
 	get)
 		target="${ARGS[2]:-}"
 		dev=""
+		# Mit Firewall-Markierung: so fragt wg-guard nach dem Weg, den die
+		# WireGuard-Pakete selbst nehmen.
+		if [ "${ARGS[3]:-}" = "mark" ]; then
+			dev="$(scen route_marked "$(scen route_default_dev 'eth0')")"
+			[ -n "$dev" ] || exit 2
+			printf '%s dev %s src 192.0.2.10 mark %s\n' "$target" "$dev" "${ARGS[4]:-0}"
+			exit 0
+		fi
 		# Zielspezifische Routen haben Vorrang (z. B. der interne Ping-Host).
 		if [ -r "$SCEN/route_$target" ] && [ "$(scen link_exists 0)" = "1" ]; then
 			dev="$(cat "$SCEN/route_$target")"
