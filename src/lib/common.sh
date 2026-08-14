@@ -264,10 +264,81 @@ config_is_complete() {
 		CONFIG_ERROR="Pflichtangaben fehlen in $CONFIG_FILE: ${missing[*]}"
 		return 1
 	fi
+	config_validate || return 1
 	return 0
 }
 
 is_full_tunnel() { [ "$TUNNEL_MODE" = "full" ]; }
+
+# Zerlegt "Host:Port" bzw. "[IPv6]:Port" in "host port".
+tcp_split_host() {
+	local spec="$1" host port
+	case "$spec" in
+	\[*\]:*)
+		host="${spec%%]*}"
+		host="${host#[}"
+		port="${spec##*:}"
+		;;
+	*)
+		host="${spec%:*}"
+		port="${spec##*:}"
+		;;
+	esac
+	printf '%s %s' "$host" "$port"
+}
+
+# Prueft eine "Host:Port"-Angabe. Bei Fehlern steht der Grund in SPEC_ERROR.
+#
+# Der haeufigste Fehler ist eine URL: "https://host" zerlegt sich naiv in den
+# Host "https" und den Port "//host", was zu voellig irrefuehrenden Meldungen
+# ueber nicht ermittelbare Routen fuehrt.
+validate_host_port() {
+	local spec="$1" name="$2" host port
+	SPEC_ERROR=""
+	[ -n "$spec" ] || return 0 # leer heisst deaktiviert
+
+	case "$spec" in
+	*://*)
+		SPEC_ERROR="$name=\"$spec\" sieht aus wie eine URL. Erwartet wird Host:Port, zum Beispiel 10.0.41.1:443."
+		return 1
+		;;
+	*/*)
+		SPEC_ERROR="$name=\"$spec\" enthaelt einen Pfad. Erwartet wird Host:Port, zum Beispiel 10.0.41.1:443."
+		return 1
+		;;
+	esac
+
+	read -r host port <<<"$(tcp_split_host "$spec")"
+	if [ -z "$host" ] || [ -z "$port" ] || [ "$host" = "$spec" ]; then
+		SPEC_ERROR="$name=\"$spec\" ist kein gueltiges Host:Port."
+		return 1
+	fi
+	case "$port" in
+	*[!0-9]*)
+		SPEC_ERROR="$name=\"$spec\": \"$port\" ist keine Portnummer."
+		return 1
+		;;
+	esac
+	if [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+		SPEC_ERROR="$name=\"$spec\": Port $port liegt ausserhalb von 1-65535."
+		return 1
+	fi
+	return 0
+}
+
+# Prueft die Werte, die erst zur Laufzeit auffallen wuerden. Rueckgabe 1 mit
+# Klartextbegruendung in CONFIG_ERROR.
+config_validate() {
+	if ! validate_host_port "$TCP_HEALTH" "TCP_HEALTH"; then
+		CONFIG_ERROR="$SPEC_ERROR"
+		return 1
+	fi
+	if ! validate_host_port "$EXTERNAL_CHECK_TCP" "EXTERNAL_CHECK_TCP"; then
+		CONFIG_ERROR="$SPEC_ERROR"
+		return 1
+	fi
+	return 0
+}
 
 # -------------------------------------------------------------- Zustand -----
 

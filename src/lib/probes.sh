@@ -259,22 +259,6 @@ stage4_ping() {
 }
 
 # ------------------------------------------- Stufe 5 – interner TCP-Dienst --
-tcp_split_host() { # gibt "host port" aus
-	local spec="$1" host port
-	case "$spec" in
-	\[*\]:*)
-		host="${spec%%]*}"
-		host="${host#[}"
-		port="${spec##*:}"
-		;;
-	*)
-		host="${spec%:*}"
-		port="${spec##*:}"
-		;;
-	esac
-	printf '%s %s' "$host" "$port"
-}
-
 stage5_tcp() {
 	STAGE_REASON=""
 	[ -n "$TCP_HEALTH" ] || {

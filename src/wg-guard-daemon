@@ -479,13 +479,23 @@ main() {
 
 	require_root
 
+	mkdir -p "$RUNDIR" "$STATEDIR" 2>/dev/null || true
+
 	if ! config_is_complete; then
 		log_error "$CONFIG_ERROR"
-		log_error "Bitte 'wg-guard setup' ausfuehren."
+		log_error "Bitte 'sudo wg-guard setup' ausfuehren."
+		# In die Zustandsdatei schreiben, damit "wg-guard status" den Grund
+		# nennen kann - sonst steht dort nur, dass der Dienst nicht laeuft.
+		ST_STATE="KONFIG_FEHLER"
+		ST_SINCE="$(now)"
+		ST_LAST_FAIL_STAGE="Konfiguration"
+		ST_LAST_FAIL_REASON="$CONFIG_ERROR"
+		ST_LAST_FAIL_TS="$(now)"
+		ST_TUNNEL="down"
+		state_write
 		exit 78 # EX_CONFIG
 	fi
 
-	mkdir -p "$RUNDIR" "$STATEDIR"
 	chmod 0755 "$STATEDIR" 2>/dev/null || true
 
 	# Lockfile gegen Parallellaeufe.

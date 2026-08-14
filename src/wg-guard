@@ -75,6 +75,24 @@ ask() { # ask <frage> <vorgabe>
 	printf '%s' "$answer"
 }
 
+# Fragt so lange, bis die Angabe ein gueltiges Host:Port ist oder leer bleibt.
+ask_host_port() { # ask_host_port <frage> <vorgabe> <name>
+	local prompt="$1" default="$2" name="$3" value
+	while :; do
+		value="$(ask "$prompt" "$default")"
+		if validate_host_port "$value" "$name"; then
+			printf '%s' "$value"
+			return 0
+		fi
+		say "  $SPEC_ERROR"
+		interactive || {
+			printf ''
+			return 0
+		}
+		default=""
+	done
+}
+
 ask_yes_no() { # ask_yes_no <frage> <j|n>
 	local prompt="$1" default="${2:-n}" answer
 	answer="$(ask "$prompt (j/n)" "$default")"
@@ -131,6 +149,7 @@ cmd_status() {
 	FEHLER) desc="unerwarteter Fehler, Tunnel wurde heruntergefahren" ;;
 	BEENDET) desc="Dienst wurde beendet" ;;
 	START) desc="startet gerade, erste Pruefung laeuft" ;;
+	KONFIG_FEHLER) desc="die Konfiguration ist fehlerhaft" ;;
 	*) desc="" ;;
 	esac
 
@@ -664,14 +683,14 @@ cmd_setup() {
 		say "steht, hinter dem aber nichts mehr ist."
 		EXTERNAL_CHECK_HOST="$(ask "Externes Ping-Ziel" "${EXTERNAL_CHECK_HOST:-1.1.1.1}")"
 		config_set EXTERNAL_CHECK_HOST "$EXTERNAL_CHECK_HOST"
-		EXTERNAL_CHECK_TCP="$(ask "Externes TCP-Ziel als Host:Port (leer = aus)" "${EXTERNAL_CHECK_TCP:-1.1.1.1:443}")"
+		EXTERNAL_CHECK_TCP="$(ask_host_port "Externes TCP-Ziel als Host:Port (leer = aus)" "${EXTERNAL_CHECK_TCP:-1.1.1.1:443}" EXTERNAL_CHECK_TCP)"
 		config_set EXTERNAL_CHECK_TCP "$EXTERNAL_CHECK_TCP"
 		say ""
 		say "Zusaetzlich koennen interne Ziele geprueft werden. Leer lassen, wenn es"
 		say "keine gibt."
 		PING_HOST="$(ask "Interner Ping-Host (optional)" "")"
 		config_set PING_HOST "$PING_HOST"
-		TCP_HEALTH="$(ask "Interner TCP-Endpunkt als Host:Port (optional)" "")"
+		TCP_HEALTH="$(ask_host_port "Interner TCP-Endpunkt als Host:Port (optional)" "" TCP_HEALTH)"
 		config_set TCP_HEALTH "$TCP_HEALTH"
 	else
 		say "Der interne Host wird per Ping geprueft (Stufe 4)."
@@ -681,7 +700,7 @@ cmd_setup() {
 		say ""
 		say "Zusaetzlich wird ein interner TCP-Dienst geprueft (Stufe 5)."
 		say "Leer lassen, wenn es keinen gibt – dann endet die Kaskade bei Stufe 4."
-		TCP_HEALTH="$(ask "Interner TCP-Endpunkt als Host:Port" "${TCP_HEALTH:-}")"
+		TCP_HEALTH="$(ask_host_port "Interner TCP-Endpunkt als Host:Port" "${TCP_HEALTH:-}" TCP_HEALTH)"
 		config_set TCP_HEALTH "$TCP_HEALTH"
 	fi
 

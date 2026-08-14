@@ -11,6 +11,9 @@ ExecStart=@LIBDIR@/wg-guard/wg-guard-daemon
 ExecStopPost=@LIBDIR@/wg-guard/wg-guard-daemon --down-only
 Restart=always
 RestartSec=5
+# 78 = EX_CONFIG: eine fehlerhafte Konfiguration repariert sich nicht durch
+# Neustarts. Der Grund steht in der Zustandsdatei und im Journal.
+RestartPreventExitStatus=78
 TimeoutStopSec=45
 KillSignal=SIGTERM
 SyslogIdentifier=wg-guard
