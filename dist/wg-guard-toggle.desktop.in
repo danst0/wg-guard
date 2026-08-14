@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=VPN pausieren / aktivieren
+GenericName=VPN-Schalter
+Comment=Schaltet die VPN-Verbindung aus oder wieder ein
+Exec=@PREFIX@/bin/wg-guard-toggle
+Icon=network-vpn
+Terminal=false
+Categories=Network;
+Keywords=VPN;WireGuard;Tunnel;
+StartupNotify=false

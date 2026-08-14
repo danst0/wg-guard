@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Mock fuer systemctl.
+set -uo pipefail
+printf 'systemctl %s\n' "$*" >>"$MOCK_LOG"
+scen() { cat "$SCEN/$1" 2>/dev/null || printf '%s' "${2:-}"; }
+
+case "${1:-}" in
+is-active) exit "$(scen service_active_rc 0)" ;;
+restart | reload-or-restart)
+	# Ein erfolgreicher Neustart aktualisiert die Zustandsdatei, genau wie es
+	# der echte Daemon taete. So laesst sich die Rollback-Logik pruefen.
+	if [ "$(scen restart_updates_state 1)" = "1" ] && [ -w "${STATEDIR:-/nonexistent}/state" ]; then
+		sed -i "s/^UPDATED=.*/UPDATED=$(date +%s)/" "$STATEDIR/state"
+	fi
+	exit "$(scen restart_rc 0)"
+	;;
+esac
+exit 0

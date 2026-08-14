@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+#
+# wg-guard-ctl – minimaler privilegierter Wrapper.
+#
+# Einziger Zweck: Ziel der sudoers-Zeile zu sein. Es werden ausschliesslich die
+# Verben "pause" und "resume" akzeptiert, alles andere wird abgewiesen. Damit
+# bleibt die Rechteerhoehung fuer den Desktop-Umschalter eng gefasst; es gibt
+# kein NOPASSWD auf beliebige Kommandos.
+
+set -euo pipefail
+
+WG_GUARD_BIN="${WG_GUARD_BIN:-@PREFIX@/bin/wg-guard}"
+if [ ! -x "$WG_GUARD_BIN" ]; then
+	WG_GUARD_BIN="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)/wg-guard"
+fi
+
+case "${1:-}" in
+pause | resume)
+	[ "$#" -eq 1 ] || {
+		printf 'wg-guard-ctl: keine weiteren Argumente erlaubt.\n' >&2
+		exit 2
+	}
+	exec "$WG_GUARD_BIN" "$1"
+	;;
+*)
+	printf 'wg-guard-ctl: nur "pause" oder "resume" sind erlaubt.\n' >&2
+	exit 2
+	;;
+esac

@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# Mock fuer curl – bedient die GitHub-API und die Release-Assets aus $SCEN/release.
+set -uo pipefail
+printf 'curl %s\n' "$*" >>"$MOCK_LOG"
+scen() { cat "$SCEN/$1" 2>/dev/null || printf '%s' "${2:-}"; }
+
+OUT=""
+URL=""
+while [ "$#" -gt 0 ]; do
+	case "$1" in
+	-o) OUT="$2"; shift 2 ;;
+	-H) shift 2 ;;
+	-fsSL|-fsS|-s|-L|-f) shift ;;
+	*) URL="$1"; shift ;;
+	esac
+done
+
+if [ "$(scen curl_rc 0)" != "0" ]; then exit "$(scen curl_rc 0)"; fi
+
+case "$URL" in
+*api.github.com*releases/latest*)
+	printf '{"tag_name": "v%s", "name": "release"}\n' "$(scen release_version '9.9.9')"
+	exit 0
+	;;
+*SHA256SUMS*)
+	src="$SCEN/release/SHA256SUMS"
+	;;
+*.tar.gz*)
+	src="$SCEN/release/$(basename "$URL")"
+	;;
+*)
+	exit 22
+	;;
+esac
+
+[ -r "$src" ] || exit 22
+if [ -n "$OUT" ]; then cp "$src" "$OUT"; else cat "$src"; fi
+exit 0

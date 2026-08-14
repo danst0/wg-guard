@@ -1,0 +1,101 @@
+# wg-guard – Konfiguration
+#
+# Shell-Syntax. Alle Werte haben Vorgaben im Programm; diese Datei enthaelt
+# ausschliesslich Abweichungen. Nach Aenderungen:
+#   sudo systemctl reload-or-restart wg-guard
+#
+# 'sudo wg-guard setup' fuellt die Pflichtangaben und die vom System
+# abhaengigen Werte automatisch aus.
+
+# ---------------------------------------------------------- Pflichtangaben --
+
+# Name der NetworkManager-Verbindung, die ueberwacht wird.
+NM_CONNECTION=""
+
+# Interface-Name des Tunnels, z. B. wg0.
+WG_INTERFACE=""
+
+# Interner Host, der per Ping geprueft wird (Stufe 4).
+PING_HOST=""
+
+# Interner TCP-Dienst als Host:Port (Stufe 5). Leer = Stufe 5 deaktiviert.
+TCP_HEALTH=""
+
+# Endpunkt-Hostname des Tunnels. Leer = aus der Peer-Konfiguration lesen.
+#ENDPOINT_HOST=""
+
+# ------------------------------------------------------------- Intervalle --
+
+# Pruefabstand im gesunden Zustand.
+#CHECK_INTERVAL_HEALTHY=60
+# Pruefabstand im Ruhezustand (kein nutzbares Netz).
+#CHECK_INTERVAL_IDLE=15
+# Pruefabstand, solange ein Fehlschlag offen ist, die Toleranz aber noch greift.
+#CHECK_INTERVAL_DEGRADED=5
+
+# ------------------------------------------------ Backoff und Flapping-Schutz
+
+#BACKOFF_INITIAL=15
+#BACKOFF_MAX=600
+#BACKOFF_FACTOR=2
+#BACKOFF_JITTER_PCT=20
+
+# Nach so vielen Fehlschlaegen innerhalb des Fensters folgt eine lange Ruhephase.
+#HYSTERESIS_FAILURES=6
+#HYSTERESIS_WINDOW=1800
+#HYSTERESIS_COOLDOWN=3600
+
+# ---------------------------------------------------------------- Timeouts --
+
+#CMD_TIMEOUT=10
+#NMCLI_UP_TIMEOUT=30
+#NMCLI_DOWN_TIMEOUT=20
+#DNS_TIMEOUT=5
+#PING_TIMEOUT=3
+#TCP_TIMEOUT=4
+
+# ------------------------------------------------------- Gesundheitspruefung
+
+# Hoechstalter des letzten WireGuard-Handshakes in Sekunden.
+#HANDSHAKE_MAX_AGE=240
+# Wartefenster nach dem Hochfahren, in dem aktiv Traffic erzeugt wird, damit
+# ueberhaupt ein Handshake zustande kommt.
+#HANDSHAKE_GRACE=25
+
+# Wie viele aufeinanderfolgende Fehlschlaege bei Ping/TCP toleriert werden,
+# bevor der Tunnel heruntergefahren wird. Sicherheitsverletzungen (Default-Route
+# gekapert, Preflight verletzt) fahren immer sofort herunter, unabhaengig davon.
+#HEALTH_FAILURES_BEFORE_DOWN=2
+
+# warn = ohne PersistentKeepalive nur warnen, enforce = nicht hochfahren.
+#REQUIRE_PERSISTENT_KEEPALIVE=warn
+
+# yes hebt die Pruefung auf Ueberlappung mit dem lokalen Netz auf.
+# Nur setzen, wenn klar ist, warum – sonst kann das Hochfahren das LAN stoeren.
+#ALLOW_LAN_OVERLAP=no
+
+# ------------------------------------------- Vom Setup ermittelte Faehigkeiten
+
+# ping-Flag fuer die Wartezeit: -W (iputils), -w (inetutils) oder leer.
+#PING_TIMEOUT_FLAG="-W"
+# Flag fuer die Interface-Bindung, leer wenn nicht moeglich.
+#PING_BIND_FLAG="-I"
+#PING_COUNT=1
+# devtcp (bash /dev/tcp) oder nc.
+#TCP_METHOD="devtcp"
+#STAGE4_ENABLED="yes"
+
+# ----------------------------------------------------------------- Betrieb --
+
+# debug | info | warn | error
+#LOG_LEVEL=info
+# Mindestabstand zwischen zwei Aufweck-Signalen des Dispatchers.
+#WAKE_DEBOUNCE=3
+
+# ---------------------------------------------------------------- Autoupdate
+
+#AUTO_UPDATE=yes
+#UPDATE_REPO="danst0/wg-guard"
+#UPDATE_CHANNEL=release
+#UPDATE_TIMEOUT=60
+#UPDATE_HEALTH_WAIT=30

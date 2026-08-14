@@ -1,0 +1,37 @@
+#!/bin/sh
+#
+# NetworkManager-Dispatcher-Hook fuer wg-guard.
+#
+# Weckt den Daemon bei Netzereignissen, damit er nicht bis zum naechsten
+# Intervall wartet. Bewusst per Signal an die PID-Datei statt ueber systemctl:
+# Dispatcher-Skripte laufen unter SELinux in einem eigenen Kontext und duerfen
+# systemctl dort nicht zwingend aufrufen.
+#
+# Das Aufwecken ist eine Beschleunigung, kein Muss. Scheitert es, prueft
+# wg-guard weiterhin im konfigurierten Intervall.
+
+IFACE="$1"
+ACTION="$2"
+
+CONFIG="@SYSCONFDIR@/wg-guard/config.conf"
+PID_FILE="/run/wg-guard/daemon.pid"
+
+# Das eigene Interface ignorieren, sonst weckt uns unser eigenes Handeln.
+WG_INTERFACE=""
+# shellcheck source=/dev/null
+[ -r "$CONFIG" ] && . "$CONFIG"
+[ -n "$WG_INTERFACE" ] && [ "$IFACE" = "$WG_INTERFACE" ] && exit 0
+
+case "$ACTION" in
+up | down | connectivity-change | vpn-up | vpn-down) ;;
+*) exit 0 ;;
+esac
+
+if [ -r "$PID_FILE" ]; then
+	PID=$(cat "$PID_FILE" 2>/dev/null)
+	if [ -n "$PID" ]; then
+		kill -USR1 "$PID" 2>/dev/null || true
+	fi
+fi
+
+exit 0

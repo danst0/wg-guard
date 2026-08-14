@@ -1,0 +1,7 @@
+# wg-guard - eng gefasste Rechteerhoehung fuer den Desktop-Umschalter.
+#
+# Nur diese beiden exakten Kommandozeilen sind erlaubt. Keine Wildcards, kein
+# NOPASSWD auf beliebige Programme. wg-guard-ctl selbst akzeptiert ausser
+# "pause" und "resume" nichts.
+%wgguard ALL=(root) NOPASSWD: @PREFIX@/bin/wg-guard-ctl pause
+%wgguard ALL=(root) NOPASSWD: @PREFIX@/bin/wg-guard-ctl resume

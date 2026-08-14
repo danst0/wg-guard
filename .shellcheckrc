@@ -1,0 +1,10 @@
+# SC2034 (unbenutzte Variable) ist hier durchgehend ein Fehlalarm: die Module
+# unter src/lib werden per source eingebunden und teilen sich Zustands- und
+# Konfigurationsvariablen ueber Dateigrenzen hinweg.
+disable=SC2034
+
+# Bibliotheken sollen beim Pruefen mitgelesen werden.
+external-sources=true
+
+# Relative source-Direktiven vom Verzeichnis des Skripts aus aufloesen.
+source-path=SCRIPTDIR

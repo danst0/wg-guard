@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Mock fuer id – die Tests laufen ohne root, sollen aber die root-Pfade pruefen.
+set -uo pipefail
+case "${1:-}" in
+-u) printf '0\n' ;;
+-nG) printf 'wgguard\n' ;;
+*) printf '0\n' ;;
+esac
+exit 0

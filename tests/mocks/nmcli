@@ -1,0 +1,131 @@
+#!/usr/bin/env bash
+# Mock fuer nmcli. Verhalten kommt aus $SCEN, jeder Aufruf wird protokolliert.
+set -uo pipefail
+
+printf 'nmcli %s\n' "$*" >>"$MOCK_LOG"
+
+scen() { cat "$SCEN/$1" 2>/dev/null || printf '%s' "${2:-}"; }
+
+CONN="$(scen conn_name 'wgtest')"
+IFACE="$(scen iface 'wgtest0')"
+
+# Argumente einsammeln, Formatflags ignorieren wir bis auf -g/-f.
+FIELDS=""
+GETTER=""
+ARGS=()
+while [ "$#" -gt 0 ]; do
+	case "$1" in
+	-t | --terse | --show-secrets | -o | --overview) shift ;;
+	-f | --fields)
+		FIELDS="$2"
+		shift 2
+		;;
+	-g | --get-values)
+		GETTER="$2"
+		shift 2
+		;;
+	-w | --wait)
+		shift 2
+		;;
+	*)
+		ARGS+=("$1")
+		shift
+		;;
+	esac
+done
+
+cmd="${ARGS[0]:-}"
+sub="${ARGS[1]:-}"
+arg="${ARGS[2]:-}"
+
+case "$cmd" in
+--version)
+	printf 'nmcli tool, version %s\n' "$(scen nm_version '1.46.0')"
+	exit 0
+	;;
+general)
+	case "$FIELDS" in
+	*STATE*CONNECTIVITY*) printf '%s:%s\n' "$(scen nm_state connected)" "$(scen nm_conn full)" ;;
+	*CONNECTIVITY*) printf '%s\n' "$(scen nm_conn full)" ;;
+	*) printf '%s\n' "$(scen nm_state connected)" ;;
+	esac
+	exit 0
+	;;
+connection)
+	case "$sub" in
+	show)
+		# Aktive Verbindungen
+		if [ "$arg" = "--active" ] || [ "${ARGS[2]:-}" = "--active" ]; then
+			if [ "$(scen nm_active 0)" = "1" ]; then
+				case "$FIELDS" in
+				*UUID*) printf 'uuid-1234:%s\n' "$IFACE" ;;
+				*) printf '%s\n' "$CONN" ;;
+				esac
+			fi
+			exit 0
+		fi
+		# Einzelne Eigenschaft
+		if [ -n "$GETTER" ]; then
+			[ -n "$arg" ] || arg="$CONN"
+			if [ "$arg" != "$CONN" ]; then exit 10; fi
+			value="$(grep -E "^$GETTER=" "$SCEN/nm_props" 2>/dev/null | head -n1 | cut -d= -f2-)"
+			printf '%s\n' "$value"
+			exit 0
+		fi
+		# Peers als nmcli-Fallback
+		if [ -n "$arg" ]; then
+			cat "$SCEN/nm_peer_dump" 2>/dev/null || true
+			exit 0
+		fi
+		# Liste aller Verbindungen
+		case "$FIELDS" in
+		*TYPE*)
+			while IFS= read -r line; do
+				[ -n "$line" ] || continue
+				printf '%s\n' "$line"
+			done < <(cat "$SCEN/nm_connections" 2>/dev/null || printf '%s:wireguard\n' "$CONN")
+			;;
+		*)
+			while IFS=: read -r name _; do
+				[ -n "$name" ] || continue
+				printf '%s\n' "$name"
+			done < <(cat "$SCEN/nm_connections" 2>/dev/null || printf '%s:wireguard\n' "$CONN")
+			;;
+		esac
+		exit 0
+		;;
+	up)
+		if [ "$(scen up_rc 0)" != "0" ]; then exit "$(scen up_rc 0)"; fi
+		printf '1' >"$SCEN/nm_active"
+		printf '1' >"$SCEN/link_exists"
+		# Simuliert den Fall, dass der Tunnel die Default-Route an sich zieht.
+		if [ "$(scen hijack_on_up 0)" = "1" ]; then
+			printf '%s' "$IFACE" >"$SCEN/route_default_dev"
+		fi
+		exit 0
+		;;
+	down)
+		if [ "$(scen down_rc 0)" != "0" ]; then exit "$(scen down_rc 0)"; fi
+		printf '0' >"$SCEN/nm_active"
+		printf '0' >"$SCEN/link_exists"
+		exit 0
+		;;
+	modify)
+		exit 0
+		;;
+	esac
+	exit 0
+	;;
+device)
+	case "$sub" in
+	disconnect)
+		if [ "$(scen dev_disconnect_rc 0)" != "0" ]; then exit "$(scen dev_disconnect_rc 0)"; fi
+		printf '0' >"$SCEN/nm_active"
+		printf '0' >"$SCEN/link_exists"
+		exit 0
+		;;
+	esac
+	exit 0
+	;;
+esac
+exit 0

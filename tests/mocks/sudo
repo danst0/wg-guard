@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Mock fuer sudo – fuehrt das Kommando ohne Rechteerhoehung aus.
+set -uo pipefail
+printf 'sudo %s\n' "$*" >>"$MOCK_LOG"
+scen() { cat "$SCEN/$1" 2>/dev/null || printf '%s' "${2:-}"; }
+ARGS=()
+while [ "$#" -gt 0 ]; do
+	case "$1" in
+	-n) shift ;;
+	*) ARGS+=("$1"); shift ;;
+	esac
+done
+if [ "$(scen sudo_rc 0)" != "0" ]; then
+	printf 'sudo: a password is required\n' >&2
+	exit "$(scen sudo_rc 0)"
+fi
+exec "${ARGS[@]}"

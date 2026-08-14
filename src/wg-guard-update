@@ -1,0 +1,310 @@
+#!/usr/bin/env bash
+#
+# wg-guard-update – Autoupdate aus getaggten GitHub-Releases.
+#
+# Grundhaltung: Jeder Schritt scheitert folgenlos. Im Zweifel bleibt die
+# installierte Version stehen. Ein kaputtes Update waere zwar fail-safe – der
+# Tunnel bliebe unten –, aber die Nutzerin staende dauerhaft ohne VPN da, ohne
+# es zu merken. Deshalb wird nach dem Neustart geprueft und notfalls automatisch
+# zurueckgerollt.
+
+set -euo pipefail
+
+# ------------------------------------------------------------ Bootstrap -----
+if [ -z "${WG_GUARD_LIBDIR:-}" ]; then
+	WG_GUARD_LIBDIR="@LIBDIR@/wg-guard"
+	[ -d "$WG_GUARD_LIBDIR/lib" ] ||
+		WG_GUARD_LIBDIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+fi
+if [ -r "$WG_GUARD_LIBDIR/VERSION" ]; then
+	WG_GUARD_VERSION="$(cat "$WG_GUARD_LIBDIR/VERSION")"
+elif [ -r "$WG_GUARD_LIBDIR/../VERSION" ]; then
+	WG_GUARD_VERSION="$(cat "$WG_GUARD_LIBDIR/../VERSION")"
+else
+	WG_GUARD_VERSION="0.0.0"
+fi
+# shellcheck source=lib/common.sh
+. "$WG_GUARD_LIBDIR/lib/common.sh"
+
+load_config
+
+SERVICE_NAME="wg-guard.service"
+MANIFEST="$STATEDIR/manifest"
+INSTALL_ENV="$STATEDIR/install.env"
+BACKUP_ROOT="$STATEDIR/backup"
+TMPDIR_UPDATE=""
+
+cleanup() {
+	if [ -n "$TMPDIR_UPDATE" ] && [ -d "$TMPDIR_UPDATE" ]; then
+		rm -rf "$TMPDIR_UPDATE"
+	fi
+}
+trap cleanup EXIT
+
+# ------------------------------------------------------ Versionsvergleich ---
+
+# version_gt <a> <b> – ist a echt groesser als b? Rein numerisch nach Punkten.
+version_gt() {
+	local a="$1" b="$2" i
+	local -a pa pb
+	IFS=. read -ra pa <<<"${a#v}"
+	IFS=. read -ra pb <<<"${b#v}"
+	for i in 0 1 2; do
+		local x="${pa[$i]:-0}" y="${pb[$i]:-0}"
+		case "$x" in *[!0-9]*) x=0 ;; esac
+		case "$y" in *[!0-9]*) y=0 ;; esac
+		if [ "$x" -gt "$y" ]; then return 0; fi
+		if [ "$x" -lt "$y" ]; then return 1; fi
+	done
+	return 1
+}
+
+# --------------------------------------------------------- Voraussetzungen --
+
+network_available() {
+	local out
+	out="$(run_timeout "$CMD_TIMEOUT" nmcli -t -f CONNECTIVITY general 2>/dev/null)" || return 1
+	[ "$out" = "full" ]
+}
+
+# Neueste veroeffentlichte Version ermitteln (nur Releases, kein main-Branch).
+latest_release_tag() {
+	local url json tag
+	url="https://api.github.com/repos/$UPDATE_REPO/releases/latest"
+	json="$(run_timeout "$UPDATE_TIMEOUT" curl -fsSL -H "Accept: application/vnd.github+json" "$url" 2>/dev/null)" || return 1
+	tag="$(printf '%s' "$json" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
+	[ -n "$tag" ] || return 1
+	printf '%s' "$tag"
+}
+
+# ------------------------------------------------------ Sicherung/Rollback --
+
+# Sichert alle laut Manifest installierten Dateien.
+make_backup() { # make_backup <zielverzeichnis>
+	local dest="$1" path
+	[ -r "$MANIFEST" ] || {
+		log_warn "Kein Manifest unter $MANIFEST – ohne Sicherung wird nicht aktualisiert."
+		return 1
+	}
+	rm -rf "$dest"
+	mkdir -p "$dest"
+	while IFS= read -r path; do
+		[ -n "$path" ] || continue
+		[ -e "$path" ] || continue
+		mkdir -p "$dest/$(dirname "$path")"
+		cp -a "$path" "$dest/$path"
+	done <"$MANIFEST"
+	cp -a "$MANIFEST" "$dest/manifest.list" 2>/dev/null || true
+	return 0
+}
+
+restore_backup() { # restore_backup <quellverzeichnis>
+	local src="$1" path
+	[ -d "$src" ] || return 1
+	while IFS= read -r path; do
+		[ -n "$path" ] || continue
+		if [ -e "$src/$path" ]; then
+			mkdir -p "$(dirname "$path")"
+			cp -a "$src/$path" "$path"
+		fi
+	done <"$src/manifest.list"
+	return 0
+}
+
+# ------------------------------------------------------ Gesundheitspruefung --
+
+# Laeuft der Dienst nach dem Neustart und schreibt er seinen Zustand fort?
+service_healthy_after_restart() {
+	local waited=0 updated_before updated_now
+	updated_before="$(state_read UPDATED 2>/dev/null || printf '0')"
+	while [ "$waited" -lt "$UPDATE_HEALTH_WAIT" ]; do
+		sleep 2
+		waited=$((waited + 2))
+		if ! systemctl is-active --quiet "$SERVICE_NAME"; then
+			continue
+		fi
+		updated_now="$(state_read UPDATED 2>/dev/null || printf '0')"
+		if [ "$updated_now" -gt "$updated_before" ] 2>/dev/null; then
+			return 0
+		fi
+	done
+	systemctl is-active --quiet "$SERVICE_NAME"
+}
+
+# ------------------------------------------------------------- Hauptlauf ----
+
+do_update() {
+	local check_only="$1"
+	local tag remote_version tarball sums url_base
+
+	if [ "$AUTO_UPDATE" != "yes" ] && [ "$check_only" -eq 0 ]; then
+		log_debug "Autoupdate ist per Konfiguration deaktiviert."
+		return 0
+	fi
+	if [ "$UPDATE_CHANNEL" != "release" ]; then
+		log_warn "Unbekannter Update-Kanal \"$UPDATE_CHANNEL\" – es wird nichts getan."
+		return 0
+	fi
+	if ! network_available; then
+		log_debug "Kein nutzbares Netz – Update wird uebersprungen."
+		return 0
+	fi
+
+	tag="$(latest_release_tag)" || {
+		log_warn "Die Release-Information von $UPDATE_REPO ist nicht abrufbar."
+		return 0
+	}
+	remote_version="${tag#v}"
+
+	if ! version_gt "$remote_version" "$WG_GUARD_VERSION"; then
+		if [ "$check_only" -eq 1 ]; then
+			printf 'wg-guard %s ist aktuell (neueste Version: %s).\n' "$WG_GUARD_VERSION" "$remote_version"
+		else
+			log_debug "Version $WG_GUARD_VERSION ist aktuell."
+		fi
+		return 0
+	fi
+
+	if [ "$check_only" -eq 1 ]; then
+		printf 'Neue Version verfuegbar: %s (installiert: %s).\n' "$remote_version" "$WG_GUARD_VERSION"
+		printf 'Installation mit: sudo wg-guard update\n'
+		return 0
+	fi
+
+	log_info "Neue Version $remote_version gefunden (installiert: $WG_GUARD_VERSION)."
+
+	TMPDIR_UPDATE="$(mktemp -d)"
+	url_base="https://github.com/$UPDATE_REPO/releases/download/$tag"
+	tarball="$TMPDIR_UPDATE/wg-guard-$remote_version.tar.gz"
+	sums="$TMPDIR_UPDATE/SHA256SUMS"
+
+	if ! run_timeout "$UPDATE_TIMEOUT" curl -fsSL -o "$tarball" "$url_base/wg-guard-$remote_version.tar.gz"; then
+		log_warn "Das Release-Archiv liess sich nicht laden."
+		return 0
+	fi
+	if ! run_timeout "$UPDATE_TIMEOUT" curl -fsSL -o "$sums" "$url_base/SHA256SUMS"; then
+		log_warn "SHA256SUMS liess sich nicht laden – ohne Pruefsumme wird nicht installiert."
+		return 0
+	fi
+
+	# Pruefsumme verifizieren. Abweichung ist ein lauter Fehler, kein Warnhinweis.
+	local expected actual
+	expected="$(grep -F "wg-guard-$remote_version.tar.gz" "$sums" | awk '{print $1}' | head -n1)"
+	actual="$(sha256sum "$tarball" | awk '{print $1}')"
+	if [ -z "$expected" ] || [ "$expected" != "$actual" ]; then
+		log_error "Pruefsumme des Release-Archivs stimmt nicht (erwartet: ${expected:-keine}, berechnet: $actual). Es wird nichts installiert."
+		return 1
+	fi
+	log_debug "Pruefsumme stimmt."
+
+	# Entpacken und Struktur pruefen.
+	local srcdir
+	mkdir -p "$TMPDIR_UPDATE/unpack"
+	if ! tar -xzf "$tarball" -C "$TMPDIR_UPDATE/unpack"; then
+		log_error "Das Release-Archiv liess sich nicht entpacken."
+		return 1
+	fi
+	srcdir="$(find "$TMPDIR_UPDATE/unpack" -maxdepth 2 -name install.sh -printf '%h\n' 2>/dev/null | head -n1)"
+	if [ -z "$srcdir" ] || [ ! -d "$srcdir/src" ] || [ ! -d "$srcdir/dist" ]; then
+		log_error "Das Release-Archiv hat nicht die erwartete Struktur."
+		return 1
+	fi
+
+	# Syntaxpruefung: ein fehlerhaftes Release darf den laufenden Watchdog
+	# niemals ersetzen.
+	local script
+	while IFS= read -r script; do
+		if ! bash -n "$script" 2>/dev/null; then
+			log_error "Syntaxfehler in $script – das Update wird abgebrochen."
+			return 1
+		fi
+	done < <(
+		find "$srcdir/src" -type f 2>/dev/null
+		printf '%s\n' "$srcdir/install.sh" "$srcdir/uninstall.sh"
+	)
+
+	# Sicherung anlegen.
+	local backup="$BACKUP_ROOT/$WG_GUARD_VERSION"
+	if ! make_backup "$backup"; then
+		log_error "Sicherung fehlgeschlagen – das Update wird abgebrochen."
+		return 1
+	fi
+	log_debug "Sicherung unter $backup angelegt."
+
+	# Installation mit denselben Pfaden wie beim Erstinstall.
+	local install_args=(--files-only)
+	if [ -r "$INSTALL_ENV" ]; then
+		# shellcheck source=/dev/null
+		. "$INSTALL_ENV"
+		# Exportieren, damit das Update exakt dorthin installiert, wo die
+		# Erstinstallation lag - auch bei abweichendem PREFIX.
+		export PREFIX LIBDIR SYSCONFDIR STATEDIR UNITDIR DISPATCHDIR SUDOERSDIR APPDIR
+		install_args+=(--prefix "${PREFIX:-/usr/local}" --sysconfdir "${SYSCONFDIR:-/etc}")
+	fi
+
+	if ! bash "$srcdir/install.sh" "${install_args[@]}"; then
+		log_error "Die Installation ist fehlgeschlagen. Stelle die vorherige Version wieder her."
+		restore_backup "$backup" || true
+		systemctl daemon-reload || true
+		systemctl restart "$SERVICE_NAME" || true
+		return 1
+	fi
+
+	systemctl daemon-reload || true
+	if ! systemctl restart "$SERVICE_NAME"; then
+		log_error "Der Dienst liess sich nach dem Update nicht starten. Rollback."
+		restore_backup "$backup" || true
+		systemctl daemon-reload || true
+		systemctl restart "$SERVICE_NAME" || true
+		return 1
+	fi
+
+	if ! service_healthy_after_restart; then
+		log_error "Der Dienst laeuft nach dem Update nicht sauber. Rollback auf $WG_GUARD_VERSION."
+		restore_backup "$backup" || true
+		systemctl daemon-reload || true
+		systemctl restart "$SERVICE_NAME" || true
+		return 1
+	fi
+
+	log_info "Update auf $remote_version erfolgreich."
+	printf 'wg-guard wurde auf %s aktualisiert.\n' "$remote_version"
+	return 0
+}
+
+usage() {
+	cat <<'EOF'
+wg-guard-update – aktualisiert wg-guard aus dem GitHub-Release.
+
+  wg-guard-update            pruefen und ggf. aktualisieren
+  wg-guard-update --check    nur pruefen, nichts installieren
+EOF
+}
+
+main() {
+	local check_only=0
+	case "${1:-}" in
+	--check) check_only=1 ;;
+	--help | -h)
+		usage
+		exit 0
+		;;
+	"") ;;
+	*)
+		usage
+		exit 2
+		;;
+	esac
+
+	if [ "$(id -u)" -ne 0 ]; then
+		printf 'wg-guard-update muss als root laufen.\n' >&2
+		exit 1
+	fi
+	if [ "$check_only" -eq 1 ]; then
+		WG_GUARD_LOG_PLAIN=1
+	fi
+
+	do_update "$check_only"
+}
+
+main "$@"

@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Mock fuer visudo – Ergebnis steuerbar.
+set -uo pipefail
+printf 'visudo %s\n' "$*" >>"$MOCK_LOG"
+scen() { cat "$SCEN/$1" 2>/dev/null || printf '%s' "${2:-}"; }
+exit "$(scen visudo_rc 0)"

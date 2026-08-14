@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+# Mock fuer iproute2.
+set -uo pipefail
+
+printf 'ip %s\n' "$*" >>"$MOCK_LOG"
+
+scen() { cat "$SCEN/$1" 2>/dev/null || printf '%s' "${2:-}"; }
+
+IFACE="$(scen iface 'wgtest0')"
+
+FAMILY=4
+ONELINE=0
+ARGS=()
+while [ "$#" -gt 0 ]; do
+	case "$1" in
+	-6)
+		FAMILY=6
+		shift
+		;;
+	-4)
+		FAMILY=4
+		shift
+		;;
+	-o | -oneline)
+		ONELINE=1
+		shift
+		;;
+	*)
+		ARGS+=("$1")
+		shift
+		;;
+	esac
+done
+
+obj="${ARGS[0]:-}"
+verb="${ARGS[1]:-}"
+
+case "$obj" in
+route)
+	case "$verb" in
+	get)
+		target="${ARGS[2]:-}"
+		dev=""
+		# Zielspezifische Routen haben Vorrang (z. B. der interne Ping-Host).
+		if [ -r "$SCEN/route_$target" ] && [ "$(scen link_exists 0)" = "1" ]; then
+			dev="$(cat "$SCEN/route_$target")"
+		elif [ "$FAMILY" = "6" ]; then
+			dev="$(scen route6_default_dev '')"
+		else
+			dev="$(scen route_default_dev 'eth0')"
+		fi
+		[ -n "$dev" ] || exit 2
+		printf '%s dev %s src 192.0.2.10 uid 0\n' "$target" "$dev"
+		exit 0
+		;;
+	show)
+		# "route show default", "route show table all default", "... dev X"
+		if printf '%s ' "${ARGS[@]}" | grep -q 'dev '; then
+			target_dev="${ARGS[${#ARGS[@]} - 1]}"
+			if [ "$target_dev" = "$IFACE" ] && [ "$(scen link_exists 0)" = "1" ]; then
+				printf '10.0.0.0/16 dev %s scope link\n' "$IFACE"
+			fi
+			exit 0
+		fi
+		if [ "$FAMILY" = "6" ]; then
+			dev="$(scen route6_default_dev '')"
+		else
+			dev="$(scen route_default_dev 'eth0')"
+		fi
+		[ -n "$dev" ] || exit 0
+		printf 'default via 192.0.2.1 dev %s proto dhcp metric 100\n' "$dev"
+		exit 0
+		;;
+	esac
+	exit 0
+	;;
+link)
+	case "$verb" in
+	show)
+		if [ "$(scen link_exists 0)" = "1" ]; then
+			printf '9: %s: <POINTOPOINT,NOARP,UP> mtu 1420 state UNKNOWN\n' "$IFACE"
+			exit 0
+		fi
+		printf 'Device "%s" does not exist.\n' "$IFACE" >&2
+		exit 1
+		;;
+	set)
+		exit 0
+		;;
+	delete)
+		if [ "$(scen link_delete_rc 0)" != "0" ]; then exit "$(scen link_delete_rc 0)"; fi
+		printf '0' >"$SCEN/link_exists"
+		printf '0' >"$SCEN/nm_active"
+		exit 0
+		;;
+	esac
+	exit 0
+	;;
+addr)
+	[ "$ONELINE" = "1" ] || exit 0
+	if [ "$FAMILY" = "4" ]; then
+		cat "$SCEN/local_addrs4" 2>/dev/null || printf '2: eth0    inet 192.168.178.20/24 brd 192.168.178.255 scope global eth0\n'
+	else
+		cat "$SCEN/local_addrs6" 2>/dev/null || true
+	fi
+	exit 0
+	;;
+esac
+exit 0

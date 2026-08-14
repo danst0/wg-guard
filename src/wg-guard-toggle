@@ -1,0 +1,126 @@
+#!/usr/bin/env bash
+#
+# wg-guard-toggle – der Desktop-Umschalter.
+#
+# Laeuft als angemeldete Benutzerin, nicht als root. Er schaltet zwischen Pause
+# und Betrieb um und meldet per notify-send zurueck, in welchem Zustand man
+# jetzt ist. Beim Aktivieren wird der Zustand kurz beobachtet, damit die
+# Rueckmeldung das tatsaechliche Ergebnis nennt und nicht nur "gestartet".
+
+set -euo pipefail
+
+STATEDIR="${STATEDIR:-/var/lib/wg-guard}"
+STATE_FILE="$STATEDIR/state"
+PAUSE_FILE="$STATEDIR/paused"
+CTL="${WG_GUARD_CTL:-@PREFIX@/bin/wg-guard-ctl}"
+ICON="network-vpn"
+TITLE="VPN"
+RESUME_WAIT="${RESUME_WAIT:-40}"
+
+notify() { # notify <dringlichkeit> <text>
+	local urgency="$1" text="$2"
+	if command -v notify-send >/dev/null 2>&1; then
+		notify-send -a "wg-guard" -i "$ICON" -u "$urgency" "$TITLE" "$text" || true
+	fi
+	printf '%s\n' "$text"
+}
+
+state_value() { # state_value <schluessel>
+	local key="$1" line
+	[ -r "$STATE_FILE" ] || return 1
+	while IFS= read -r line; do
+		case "$line" in
+		"$key="*)
+			printf '%s' "${line#*=}"
+			return 0
+			;;
+		esac
+	done <"$STATE_FILE"
+	return 1
+}
+
+# Uebersetzt den internen Zustand in einen Satz, den man ohne Vorwissen versteht.
+explain_state() {
+	local st reason stage
+	st="$(state_value STATE || printf 'unbekannt')"
+	reason="$(state_value LAST_FAIL_REASON || printf '')"
+	stage="$(state_value LAST_FAIL_STAGE || printf '')"
+	case "$st" in
+	GESUND) printf 'Das VPN ist aktiv und funktioniert.' ;;
+	RUHE) printf 'Es ist gerade kein Netzwerk verfuegbar. Das VPN verbindet sich automatisch, sobald wieder eines da ist.' ;;
+	VERBINDET) printf 'Das VPN wird gerade aufgebaut.' ;;
+	BACKOFF | COOLDOWN)
+		case "$stage" in
+		1) printf 'Die Gegenstelle ist im Moment nicht erreichbar (Adresse nicht aufloesbar). Es wird automatisch weiter versucht.' ;;
+		3) printf 'Die Gegenstelle antwortet nicht. Es wird automatisch weiter versucht.' ;;
+		4 | 5) printf 'Die Verbindung steht, aber der interne Dienst antwortet nicht. Es wird automatisch weiter versucht.' ;;
+		*) printf 'Das VPN ist im Moment nicht verfuegbar. Es wird automatisch weiter versucht.' ;;
+		esac
+		;;
+	PREFLIGHT_FEHLER) printf 'Die VPN-Konfiguration ist nicht sicher und wurde deshalb nicht aktiviert. Bitte den Administrator ansprechen.' ;;
+	PAUSIERT) printf 'Das VPN ist pausiert.' ;;
+	*)
+		if [ -n "$reason" ]; then
+			printf 'Das VPN ist nicht aktiv (%s).' "$reason"
+		else
+			printf 'Das VPN ist nicht aktiv.'
+		fi
+		;;
+	esac
+}
+
+run_ctl() { # run_ctl <pause|resume>
+	local verb="$1" out rc=0
+	out="$(sudo -n "$CTL" "$verb" 2>&1)" || rc=$?
+	if [ "$rc" -ne 0 ]; then
+		case "$out" in
+		*"password is required"* | *"Passwort"* | *"sudo:"*)
+			notify critical "Berechtigung fehlt. Bitte einmal ab- und wieder anmelden; danach funktioniert der Schalter."
+			;;
+		*)
+			notify critical "Der VPN-Schalter konnte nicht ausgefuehrt werden."
+			;;
+		esac
+		return 1
+	fi
+	return 0
+}
+
+do_pause() {
+	run_ctl pause || return 1
+	notify normal "Das VPN ist jetzt pausiert. Die normale Internetverbindung ist davon nicht betroffen."
+}
+
+do_resume() {
+	run_ctl resume || return 1
+	notify low "Das VPN wird aktiviert. Das kann einen Moment dauern ..."
+
+	# Auf ein Ergebnis warten, damit die Rueckmeldung etwas wert ist.
+	local waited=0 st
+	while [ "$waited" -lt "$RESUME_WAIT" ]; do
+		sleep 2
+		waited=$((waited + 2))
+		st="$(state_value STATE || printf '')"
+		case "$st" in
+		GESUND)
+			notify normal "Das VPN ist aktiv und funktioniert."
+			return 0
+			;;
+		PREFLIGHT_FEHLER)
+			notify critical "$(explain_state)"
+			return 0
+			;;
+		esac
+	done
+	notify normal "$(explain_state)"
+}
+
+main() {
+	if [ -e "$PAUSE_FILE" ]; then
+		do_resume
+	else
+		do_pause
+	fi
+}
+
+main "$@"

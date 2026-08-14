@@ -1,0 +1,13 @@
+[Unit]
+Description=Taegliche Aktualisierungspruefung fuer wg-guard
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+# Streuung, damit nicht alle Rechner gleichzeitig laden.
+RandomizedDelaySec=3h
+# Verpasste Laeufe nachholen - der Rechner steht nachts nicht zwingend an.
+Persistent=true
+Unit=wg-guard-update.service
+
+[Install]
+WantedBy=timers.target

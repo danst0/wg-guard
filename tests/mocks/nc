@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Mock fuer netcat (TCP-Pruefung, Stufe 5).
+set -uo pipefail
+printf 'nc %s\n' "$*" >>"$MOCK_LOG"
+scen() { cat "$SCEN/$1" 2>/dev/null || printf '%s' "${2:-}"; }
+exit "$(scen tcp_rc 0)"

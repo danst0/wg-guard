@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Mock fuer wireguard-tools.
+set -uo pipefail
+printf 'wg %s\n' "$*" >>"$MOCK_LOG"
+scen() { cat "$SCEN/$1" 2>/dev/null || printf '%s' "${2:-}"; }
+
+if [ "${1:-}" = "show" ] && [ "${3:-}" = "latest-handshakes" ]; then
+	if [ "$(scen link_exists 0)" != "1" ]; then
+		printf 'Unable to access interface: No such device\n' >&2
+		exit 1
+	fi
+	ts="$(scen handshake_ts '')"
+	if [ -z "$ts" ]; then exit 1; fi
+	# Relativ zur gefaelschten Uhr: "-30" bedeutet 30 Sekunden alt.
+	case "$ts" in
+	-*)
+		now="$(cat "$FAKE_TIME_FILE" 2>/dev/null || date +%s)"
+		ts=$(( now - ${ts#-} ))
+		;;
+	esac
+	printf 'PEERKEY123=\t%s\n' "$ts"
+	exit 0
+fi
+exit 0

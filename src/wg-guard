@@ -1,0 +1,688 @@
+#!/usr/bin/env bash
+#
+# wg-guard – Kommandozeile.
+#
+# Fuer die taegliche Bedienung ist der Desktop-Eintrag gedacht; dieses Werkzeug
+# ist fuer Einrichtung und Fehlersuche.
+
+set -euo pipefail
+
+# ------------------------------------------------------------ Bootstrap -----
+if [ -z "${WG_GUARD_LIBDIR:-}" ]; then
+	WG_GUARD_LIBDIR="@LIBDIR@/wg-guard"
+	[ -d "$WG_GUARD_LIBDIR/lib" ] ||
+		WG_GUARD_LIBDIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+fi
+if [ -r "$WG_GUARD_LIBDIR/VERSION" ]; then
+	WG_GUARD_VERSION="$(cat "$WG_GUARD_LIBDIR/VERSION")"
+elif [ -r "$WG_GUARD_LIBDIR/../VERSION" ]; then
+	WG_GUARD_VERSION="$(cat "$WG_GUARD_LIBDIR/../VERSION")"
+else
+	WG_GUARD_VERSION="unbekannt"
+fi
+export WG_GUARD_VERSION
+WG_GUARD_LIBEXEC="${WG_GUARD_LIBEXEC:-$WG_GUARD_LIBDIR}"
+# shellcheck source=lib/common.sh
+. "$WG_GUARD_LIBDIR/lib/common.sh"
+# shellcheck source=lib/platform.sh
+. "$WG_GUARD_LIBDIR/lib/platform.sh"
+# shellcheck source=lib/nm.sh
+. "$WG_GUARD_LIBDIR/lib/nm.sh"
+# shellcheck source=lib/safety.sh
+. "$WG_GUARD_LIBDIR/lib/safety.sh"
+# shellcheck source=lib/probes.sh
+. "$WG_GUARD_LIBDIR/lib/probes.sh"
+
+# Die CLI schreibt Klartext, keine journald-Praefixe.
+WG_GUARD_LOG_PLAIN=1
+export WG_GUARD_LOG_PLAIN
+
+load_config
+
+SERVICE_NAME="wg-guard.service"
+
+# ----------------------------------------------------------- Ein-/Ausgabe ---
+
+# Liest von /dev/tty statt von stdin – sonst verschluckt ein
+# "curl ... | sudo bash" das Skript selbst.
+TTY_IN=""
+open_tty() {
+	if [ -n "$TTY_IN" ]; then return 0; fi
+	if [ -r /dev/tty ]; then
+		TTY_IN="/dev/tty"
+		return 0
+	fi
+	return 1
+}
+
+interactive() { open_tty; }
+
+ask() { # ask <frage> <vorgabe>
+	local prompt="$1" default="${2:-}" answer=""
+	open_tty || {
+		printf '%s' "$default"
+		return 0
+	}
+	if [ -n "$default" ]; then
+		printf '%s [%s]: ' "$prompt" "$default" >&2
+	else
+		printf '%s: ' "$prompt" >&2
+	fi
+	IFS= read -r answer <"$TTY_IN" || true
+	[ -n "$answer" ] || answer="$default"
+	printf '%s' "$answer"
+}
+
+ask_yes_no() { # ask_yes_no <frage> <j|n>
+	local prompt="$1" default="${2:-n}" answer
+	answer="$(ask "$prompt (j/n)" "$default")"
+	case "$answer" in
+	j | J | ja | Ja | y | Y | yes) return 0 ;;
+	*) return 1 ;;
+	esac
+}
+
+say() { printf '%s\n' "$*"; }
+head_line() { printf '\n== %s ==\n' "$*"; }
+
+# --------------------------------------------------------------- status -----
+
+cmd_status() {
+	local st since updated fail_stage fail_reason fail_ts next paused tunnel version healthy
+	if [ ! -r "$STATE_FILE" ]; then
+		say "wg-guard: kein Zustand vorhanden."
+		if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
+			say "Der Dienst laeuft, hat aber noch nichts geschrieben. Bitte kurz warten."
+		else
+			say "Der Dienst laeuft nicht. Start mit: sudo systemctl start $SERVICE_NAME"
+		fi
+		return 0
+	fi
+
+	st="$(state_read STATE || printf 'unbekannt')"
+	since="$(state_read SINCE || printf '0')"
+	updated="$(state_read UPDATED || printf '0')"
+	fail_stage="$(state_read LAST_FAIL_STAGE || printf '')"
+	fail_reason="$(state_read LAST_FAIL_REASON || printf '')"
+	fail_ts="$(state_read LAST_FAIL_TS || printf '0')"
+	next="$(state_read NEXT_ATTEMPT || printf '0')"
+	paused="$(state_read PAUSED || printf 'no')"
+	tunnel="$(state_read TUNNEL || printf 'unbekannt')"
+	version="$(state_read VERSION || printf '?')"
+	healthy="$(state_read LAST_HEALTHY_TS || printf '0')"
+
+	local desc
+	case "$st" in
+	GESUND) desc="Tunnel ist oben und geprueft" ;;
+	RUHE) desc="kein nutzbares Netz – Tunnel bleibt unten" ;;
+	PAUSIERT) desc="vom Nutzer pausiert" ;;
+	BACKOFF) desc="wartet auf den naechsten Versuch" ;;
+	COOLDOWN) desc="laengere Ruhephase nach vielen Fehlschlaegen" ;;
+	VERBINDET) desc="Verbindungsaufbau laeuft" ;;
+	PREFLIGHT_FEHLER) desc="Konfiguration der NM-Verbindung ist nicht sicher" ;;
+	FEHLER) desc="unerwarteter Fehler, Tunnel wurde heruntergefahren" ;;
+	*) desc="" ;;
+	esac
+
+	say "wg-guard $version"
+	if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
+		say "  Dienst:     laeuft"
+	else
+		say "  Dienst:     laeuft NICHT (sudo systemctl start $SERVICE_NAME)"
+	fi
+	say "  Zustand:    $st${desc:+ ($desc)}"
+	say "  seit:       $(human_timestamp "$since") – vor $(human_duration "$(($(now) - since))")"
+	say "  Tunnel:     $tunnel"
+	say "  Pausiert:   $([ "$paused" = "yes" ] && printf 'ja' || printf 'nein')"
+
+	if [ -n "$fail_stage" ]; then
+		say "  Letzter Fehlschlag: Stufe $fail_stage vor $(human_duration "$(($(now) - fail_ts))")"
+		say "                      $fail_reason"
+	fi
+	if [ "$healthy" -gt 0 ] 2>/dev/null; then
+		say "  Zuletzt gesund:     $(human_timestamp "$healthy")"
+	fi
+	if [ "$next" -gt "$(now)" ] 2>/dev/null; then
+		say "  Naechster Versuch:  in $(human_duration "$((next - $(now)))")"
+	fi
+	if [ "$(($(now) - updated))" -gt 300 ]; then
+		say ""
+		say "  Hinweis: Der Zustand wurde zuletzt vor $(human_duration "$(($(now) - updated))") aktualisiert."
+	fi
+}
+
+# ---------------------------------------------------------------- check -----
+
+# Rein lesende Diagnose. Faehrt niemals etwas hoch oder herunter.
+cmd_check() {
+	detect_distro
+
+	head_line "Umgebung"
+	say "  Distribution:    $DISTRO_NAME (Familie: $DISTRO_FAMILY)"
+	if nm_version_ok; then
+		say "  NetworkManager:  $NM_VERSION"
+	else
+		say "  NetworkManager:  Version nicht ermittelbar oder aelter als 1.16"
+	fi
+	say "  bash:            ${BASH_VERSION}"
+	say "  systemd:         $(have_systemd && printf 'ja' || printf 'nein')"
+	say "  SELinux:         $(selinux_enabled && printf 'aktiv' || printf 'inaktiv oder nicht vorhanden')"
+	if check_binaries; then
+		say "  Werkzeuge:       vollstaendig"
+	else
+		say "  Werkzeuge:       FEHLEN: ${MISSING_REQUIRED[*]}"
+	fi
+	if [ "${#MISSING_OPTIONAL[@]}" -gt 0 ]; then
+		say "  Optional fehlt:  ${MISSING_OPTIONAL[*]} (nur fuer Rueckmeldungen an die Nutzerin)"
+	fi
+	say "  Ping-Flags:      ${PING_TIMEOUT_FLAG:-<keine>} / Bindung: ${PING_BIND_FLAG:-<keine>}"
+	say "  TCP-Methode:     $TCP_METHOD"
+	if [ -e "$PID_FILE" ]; then
+		say "  Aufweck-Kanal:   PID-Datei vorhanden ($(cat "$PID_FILE"))"
+	else
+		say "  Aufweck-Kanal:   keine PID-Datei – der Daemon laeuft vermutlich nicht"
+	fi
+
+	head_line "Konfiguration"
+	if ! config_is_complete; then
+		say "  $CONFIG_ERROR"
+		say "  Bitte 'sudo wg-guard setup' ausfuehren."
+		return 1
+	fi
+	say "  Datei:           $CONFIG_FILE"
+	say "  Verbindung:      $NM_CONNECTION"
+	say "  Interface:       $WG_INTERFACE"
+	say "  Ping-Ziel:       ${PING_HOST:-<keins>}"
+	say "  TCP-Ziel:        ${TCP_HEALTH:-<deaktiviert>}"
+
+	head_line "Preflight"
+	if ! is_root; then
+		say "  Hinweis: ohne root sind AllowedIPs und Handshake nicht vollstaendig pruefbar."
+	fi
+	preflight_run || true
+	preflight_print
+
+	head_line "Kaskade"
+	local rc
+	if stage0_network_ready; then
+		say "  [ok]   Stufe 0  Netz vorhanden, Default-Route liegt nicht am Tunnel."
+	else
+		say "  [ruhe] Stufe 0  $STAGE_REASON"
+		say "         (Das ist kein Fehler – ohne Netz bleibt der Tunnel unten.)"
+		return 0
+	fi
+
+	if stage1_resolve_endpoint; then
+		say "  [ok]   Stufe 1  Endpunkt \"${RESOLVED_ENDPOINT_HOST:-?}\" ist aufloesbar."
+	else
+		say "  [FEHL] Stufe 1  $STAGE_REASON"
+		return 1
+	fi
+
+	if ! nm_is_active; then
+		say "  [--]   Stufe 2  Tunnel ist unten. Die Stufen 3 bis 5 lassen sich so nicht pruefen."
+		say "         'check' faehrt bewusst nichts hoch. Fuer einen echten Versuch den Dienst starten."
+		return 0
+	fi
+	say "  [ok]   Stufe 2  Tunnel ist aktiv."
+
+	if check_default_route_safe; then
+		say "  [ok]   Q1–Q3   Der Tunnel hat die Default-Route nicht uebernommen."
+	else
+		say "  [FEHL] Q1–Q3   $SAFETY_REASON"
+	fi
+
+	if stage3_handshake_quick; then
+		say "  [ok]   Stufe 3  Frischer Handshake vorhanden."
+	else
+		say "  [FEHL] Stufe 3  $STAGE_REASON"
+	fi
+
+	rc=0
+	stage4_ping || rc=$?
+	if [ "$rc" -eq 0 ]; then
+		say "  [ok]   Stufe 4  $PING_HOST antwortet."
+	else
+		say "  [FEHL] Stufe 4  $STAGE_REASON"
+	fi
+
+	rc=0
+	stage5_tcp || rc=$?
+	if [ "$rc" -eq 0 ]; then
+		say "  [ok]   Stufe 5  ${TCP_HEALTH:-<deaktiviert>} nimmt Verbindungen an."
+	else
+		say "  [FEHL] Stufe 5  $STAGE_REASON"
+	fi
+	return 0
+}
+
+# ------------------------------------------------------- pause / resume -----
+
+wake_daemon() {
+	local pid
+	[ -r "$PID_FILE" ] || return 1
+	pid="$(cat "$PID_FILE")"
+	[ -n "$pid" ] || return 1
+	kill -USR1 "$pid" 2>/dev/null || return 1
+	return 0
+}
+
+cmd_pause() {
+	require_root
+	set_paused
+	log_info "Pause aktiviert."
+	if ! wake_daemon; then
+		# Kein Daemon erreichbar – dann fahren wir selbst herunter, damit die
+		# Pause auch ohne laufenden Dienst wirkt.
+		if config_is_complete; then
+			ensure_down "Pause ohne laufenden Daemon" || true
+		fi
+	fi
+	say "VPN pausiert. Der Tunnel bleibt unten, bis er wieder aktiviert wird."
+}
+
+cmd_resume() {
+	require_root
+	clear_paused
+	log_info "Pause aufgehoben."
+	wake_daemon || true
+	say "VPN aktiviert. Der Tunnel wird aufgebaut, sobald alle Pruefungen bestehen."
+}
+
+# ----------------------------------------------------------------- logs -----
+
+cmd_logs() {
+	local follow=0
+	case "${1:-}" in
+	-f | --follow) follow=1 ;;
+	esac
+	if [ "$follow" -eq 1 ]; then
+		exec journalctl -u "$SERVICE_NAME" -n 50 -f
+	fi
+	exec journalctl -u "$SERVICE_NAME" -n 100 --no-pager
+}
+
+# ------------------------------------------------------------- preflight ----
+
+cmd_preflight() {
+	local do_fix=0
+	case "${1:-}" in
+	--fix) do_fix=1 ;;
+	esac
+
+	if ! config_is_complete; then
+		say "$CONFIG_ERROR"
+		return 1
+	fi
+
+	preflight_run || true
+	preflight_print
+
+	if [ "$PREFLIGHT_FAILED" -eq 0 ]; then
+		say ""
+		say "Preflight bestanden."
+		return 0
+	fi
+
+	say ""
+	say "$PREFLIGHT_FAILED Punkt(e) verhindern das Hochfahren."
+	[ "$do_fix" -eq 1 ] || {
+		say "Mit 'sudo wg-guard preflight --fix' koennen die reparierbaren Punkte gesetzt werden."
+		return 1
+	}
+
+	require_root
+	local entry code status text fix applied=0
+	for entry in "${PREFLIGHT_RESULTS[@]}"; do
+		IFS='|' read -r code status text fix <<<"$entry"
+		[ "$status" = "fail" ] || continue
+		[ -n "$fix" ] || {
+			say "  $code laesst sich nicht automatisch reparieren: $text"
+			continue
+		}
+		say ""
+		say "  $code: $text"
+		if ask_yes_no "  Soll ich '$fix' ausfuehren?" "n"; then
+			if eval "$fix"; then
+				say "  erledigt."
+				applied=$((applied + 1))
+			else
+				say "  fehlgeschlagen."
+			fi
+		else
+			say "  uebersprungen."
+		fi
+	done
+
+	if [ "$applied" -gt 0 ]; then
+		say ""
+		say "Erneuter Preflight:"
+		preflight_run || true
+		preflight_print
+	fi
+	[ "$PREFLIGHT_FAILED" -eq 0 ]
+}
+
+# ----------------------------------------------------------------- setup ----
+
+# Schreibt einen einzelnen Schluessel in die Konfigurationsdatei.
+config_set() {
+	local key="$1" value="$2" tmp
+	mkdir -p "$(dirname "$CONFIG_FILE")"
+	touch "$CONFIG_FILE"
+	tmp="$(mktemp)"
+	grep -vE "^[[:space:]]*$key=" "$CONFIG_FILE" >"$tmp" 2>/dev/null || true
+	printf '%s="%s"\n' "$key" "$value" >>"$tmp"
+	cat "$tmp" >"$CONFIG_FILE"
+	rm -f "$tmp"
+	chmod 0644 "$CONFIG_FILE"
+}
+
+setup_choose_connection() {
+	local conns=() line i choice
+	while IFS= read -r line; do
+		[ -n "$line" ] || continue
+		conns+=("$line")
+	done < <(nm_list_wireguard_connections)
+
+	if [ "${#conns[@]}" -eq 0 ]; then
+		say "Es existiert keine NetworkManager-Verbindung vom Typ WireGuard."
+		say ""
+		say "wg-guard richtet keinen Tunnel ein, sondern ueberwacht einen vorhandenen."
+		say "Bitte zuerst die WireGuard-Verbindung in NetworkManager anlegen und"
+		say "'sudo wg-guard setup' danach erneut ausfuehren."
+		return 1
+	fi
+
+	if [ "${#conns[@]}" -eq 1 ]; then
+		say "Gefundene WireGuard-Verbindung: ${conns[0]}"
+		NM_CONNECTION="${conns[0]}"
+		return 0
+	fi
+
+	say "Welche Verbindung soll ueberwacht werden?"
+	for i in "${!conns[@]}"; do
+		printf '  %d) %s\n' "$((i + 1))" "${conns[$i]}"
+	done
+	choice="$(ask "Nummer" "1")"
+	case "$choice" in
+	'' | *[!0-9]*) choice=1 ;;
+	esac
+	if [ "$choice" -lt 1 ] || [ "$choice" -gt "${#conns[@]}" ]; then choice=1; fi
+	NM_CONNECTION="${conns[$((choice - 1))]}"
+	return 0
+}
+
+setup_detect_capabilities() {
+	say ""
+	say "Ermittle die Faehigkeiten dieses Systems ..."
+
+	local flag bind method
+	if flag="$(detect_ping_timeout_flag)"; then
+		PING_TIMEOUT_FLAG="$flag"
+		say "  ping-Zeitflag:    ${flag:-<keins noetig>}"
+	else
+		say "  ping funktioniert hier nicht (ICMP gesperrt oder unprivilegierte Sockets aus)."
+		if ask_yes_no "  Soll Stufe 4 (Ping) deaktiviert werden? Stufe 5 traegt dann die Pruefung." "j"; then
+			STAGE4_ENABLED="no"
+		fi
+	fi
+	bind="$(detect_ping_bind_flag)"
+	PING_BIND_FLAG="$bind"
+	say "  ping-Bindung:     ${bind:-<nicht moeglich, Routenpruefung greift>}"
+
+	if method="$(detect_tcp_method)"; then
+		TCP_METHOD="$method"
+		say "  TCP-Methode:      $method"
+	else
+		say "  Weder bash /dev/tcp noch nc verfuegbar – Stufe 5 wird deaktiviert."
+		TCP_HEALTH=""
+	fi
+
+	config_set PING_TIMEOUT_FLAG "$PING_TIMEOUT_FLAG"
+	config_set PING_BIND_FLAG "$PING_BIND_FLAG"
+	config_set TCP_METHOD "$TCP_METHOD"
+	config_set STAGE4_ENABLED "$STAGE4_ENABLED"
+}
+
+setup_check_environment() {
+	detect_distro
+	say "System: $DISTRO_NAME"
+
+	if ! have_systemd; then
+		say ""
+		say "FEHLER: Dieses System nutzt kein systemd."
+		say "wg-guard braucht systemd fuer Dienst, Timer und Logging und wird hier"
+		say "nicht installiert, statt halb zu funktionieren."
+		return 1
+	fi
+	if ! bash_version_ok; then
+		say "FEHLER: bash ${BASH_VERSION} ist zu alt, benoetigt wird mindestens 4.2."
+		return 1
+	fi
+
+	if ! check_binaries; then
+		say ""
+		say "Es fehlen folgende Programme: ${MISSING_REQUIRED[*]}"
+		local bin pkgs=() pkg
+		for bin in "${MISSING_REQUIRED[@]}"; do
+			pkg="$(package_for "$bin")"
+			if [ -n "$pkg" ]; then pkgs+=("$pkg"); fi
+		done
+		if [ -n "$PKG_INSTALL_CMD" ] && [ "${#pkgs[@]}" -gt 0 ]; then
+			say "Vorschlag: $PKG_INSTALL_CMD ${pkgs[*]}"
+			if ask_yes_no "Sollen diese Pakete jetzt installiert werden?" "j"; then
+				# shellcheck disable=SC2086
+				$PKG_INSTALL_CMD "${pkgs[@]}" || true
+			fi
+		else
+			say "Diese Distribution ist nicht hinterlegt – bitte die genannten Programme"
+			say "mit dem eigenen Paketmanager nachinstallieren."
+		fi
+		if ! check_binaries; then
+			say "FEHLER: es fehlen weiterhin: ${MISSING_REQUIRED[*]}"
+			return 1
+		fi
+	fi
+
+	if ! nm_version_ok; then
+		say ""
+		say "FEHLER: NetworkManager ist nicht ansprechbar oder aelter als 1.16."
+		say "Vor 1.16 kennt NetworkManager kein WireGuard."
+		return 1
+	fi
+	say "NetworkManager $NM_VERSION"
+
+	if [ "${#MISSING_OPTIONAL[@]}" -gt 0 ]; then
+		say "Hinweis: ${MISSING_OPTIONAL[*]} fehlt – der Desktop-Umschalter kann dann"
+		say "keine Rueckmeldung anzeigen."
+	fi
+	return 0
+}
+
+setup_group() {
+	local user
+	if ! getent group wgguard >/dev/null 2>&1; then
+		say ""
+		say "Lege die Gruppe 'wgguard' an (fuer den Desktop-Umschalter ohne Passwort)."
+		groupadd wgguard || true
+	fi
+	user="${SUDO_USER:-}"
+	[ -n "$user" ] || user="$(ask "Fuer welche Benutzerin soll der VPN-Schalter freigeschaltet werden?" "")"
+	[ -n "$user" ] || return 0
+	if id -nG "$user" 2>/dev/null | tr ' ' '\n' | grep -qx wgguard; then
+		say "Benutzerin '$user' ist bereits in der Gruppe wgguard."
+		return 0
+	fi
+	if ask_yes_no "Benutzerin '$user' zur Gruppe wgguard hinzufuegen?" "j"; then
+		if usermod -aG wgguard "$user"; then
+			say "Erledigt. Wichtig: erst nach einer Neuanmeldung wirksam."
+		fi
+	fi
+}
+
+setup_test_wake() {
+	say ""
+	say "Teste den Aufweck-Kanal ..."
+	if [ ! -r "$PID_FILE" ]; then
+		say "  Der Daemon laeuft noch nicht – der Kanal wird beim ersten Start geprueft."
+		return 0
+	fi
+	if wake_daemon; then
+		say "  Der Dispatcher-Hook kann den Daemon erreichen."
+	else
+		say "  Der Daemon liess sich nicht signalisieren. Das ist kein Beinbruch:"
+		say "  wg-guard prueft dann im festen Intervall statt sofort auf Netzereignisse."
+	fi
+}
+
+cmd_setup() {
+	require_root
+
+	say "wg-guard $WG_GUARD_VERSION – Einrichtung"
+	say ""
+	if ! interactive; then
+		say "Kein Terminal verfuegbar (kein /dev/tty)."
+		say "Bitte 'sudo wg-guard setup' in einem Terminal ausfuehren."
+		return 1
+	fi
+
+	setup_check_environment || return 1
+
+	say ""
+	setup_choose_connection || return 1
+	config_set NM_CONNECTION "$NM_CONNECTION"
+
+	# Interface und Endpunkt lassen sich ableiten – danach muss niemand fragen.
+	local iface endpoint
+	iface="$(nm_interface_name)" || iface=""
+	if [ -z "$iface" ]; then
+		iface="$(ask "Interface-Name der Verbindung" "wg0")"
+	else
+		say "Interface:     $iface (aus der Verbindung uebernommen)"
+	fi
+	WG_INTERFACE="$iface"
+	config_set WG_INTERFACE "$WG_INTERFACE"
+
+	endpoint="$(nm_endpoint_host 2>/dev/null)" || endpoint=""
+	if [ -n "$endpoint" ]; then
+		say "Endpunkt:      $endpoint (aus der Verbindung uebernommen)"
+	else
+		say "Der Endpunkt liess sich nicht auslesen."
+		endpoint="$(ask "Endpunkt-Hostname des Tunnels (leer = Stufe 1 ueberspringen)" "")"
+		if [ -n "$endpoint" ]; then config_set ENDPOINT_HOST "$endpoint"; fi
+	fi
+
+	# Ping-Ziel aus den AllowedIPs vorschlagen.
+	local suggestion="" ips first
+	if ips="$(nm_allowed_ips)"; then
+		while IFS= read -r first; do
+			case "$first" in
+			*:*) continue ;;
+			*/*)
+				suggestion="$(first_host_in_prefix "$first")" || suggestion=""
+				break
+				;;
+			esac
+		done <<<"$ips"
+	fi
+	say ""
+	say "Der interne Host wird per Ping geprueft (Stufe 4)."
+	PING_HOST="$(ask "Interner Ping-Host" "$suggestion")"
+	config_set PING_HOST "$PING_HOST"
+
+	say ""
+	say "Zusaetzlich wird ein interner TCP-Dienst geprueft (Stufe 5)."
+	say "Leer lassen, wenn es keinen gibt – dann endet die Kaskade bei Stufe 4."
+	TCP_HEALTH="$(ask "Interner TCP-Endpunkt als Host:Port" "${TCP_HEALTH:-}")"
+	config_set TCP_HEALTH "$TCP_HEALTH"
+
+	setup_detect_capabilities
+
+	say ""
+	say "Pruefe die Konfiguration der NM-Verbindung ..."
+	say ""
+	cmd_preflight --fix || true
+
+	setup_group
+	setup_test_wake
+
+	say ""
+	if ask_yes_no "Soll der Dienst jetzt aktiviert und gestartet werden?" "j"; then
+		systemctl daemon-reload || true
+		systemctl enable --now "$SERVICE_NAME" || true
+		systemctl enable --now wg-guard-update.timer 2>/dev/null || true
+		say ""
+		say "Gestartet. Der aktuelle Zustand:"
+		say ""
+		wait_interval 3
+		cmd_status
+	else
+		say "Spaeter mit 'sudo systemctl enable --now $SERVICE_NAME' starten."
+	fi
+
+	say ""
+	say "Fertig. Die Nutzerin bedient das VPN ueber den Eintrag"
+	say "\"VPN pausieren / aktivieren\" im Anwendungsmenue."
+	return 0
+}
+
+# ---------------------------------------------------------------- update ----
+
+cmd_update() {
+	local updater="$WG_GUARD_LIBEXEC/wg-guard-update"
+	if [ ! -x "$updater" ]; then
+		say "Der Updater ist nicht installiert ($updater)."
+		return 1
+	fi
+	require_root
+	exec "$updater" "$@"
+}
+
+# ----------------------------------------------------------------- main -----
+
+usage() {
+	cat <<'EOF'
+wg-guard – Watchdog fuer eine WireGuard-Verbindung.
+
+Aufruf: wg-guard <befehl>
+
+  status              Zustand in Klartext: welche Stufe zuletzt scheiterte,
+                      seit wann, wann der naechste Versuch laeuft
+  check               Vollstaendige Diagnose, rein lesend – faehrt nichts hoch
+  pause               VPN pausieren (ueberlebt einen Neustart)
+  resume              Pause aufheben
+  logs [-f]           Protokoll aus journald
+  setup               Interaktive Ersteinrichtung
+  preflight [--fix]   Sicherheitspruefung der NM-Verbindung
+  update [--check]    Auf eine neue Version pruefen und aktualisieren
+  version             Version anzeigen
+
+Konfiguration: /etc/wg-guard/config.conf
+EOF
+}
+
+main() {
+	local cmd="${1:-status}"
+	[ "$#" -gt 0 ] && shift || true
+	case "$cmd" in
+	status) cmd_status "$@" ;;
+	check) cmd_check "$@" ;;
+	pause) cmd_pause "$@" ;;
+	resume) cmd_resume "$@" ;;
+	logs) cmd_logs "$@" ;;
+	setup) cmd_setup "$@" ;;
+	preflight) cmd_preflight "$@" ;;
+	update) cmd_update "$@" ;;
+	version) say "wg-guard $WG_GUARD_VERSION" ;;
+	help | --help | -h) usage ;;
+	*)
+		say "Unbekannter Befehl: $cmd"
+		say ""
+		usage
+		exit 2
+		;;
+	esac
+}
+
+main "$@"

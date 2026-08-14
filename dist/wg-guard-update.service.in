@@ -1,0 +1,9 @@
+[Unit]
+Description=Aktualisierungspruefung fuer wg-guard
+Documentation=https://github.com/danst0/wg-guard
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=@LIBDIR@/wg-guard/wg-guard-update
+SyslogIdentifier=wg-guard-update

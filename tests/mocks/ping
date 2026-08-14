@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Mock fuer ping.
+set -uo pipefail
+printf 'ping %s\n' "$*" >>"$MOCK_LOG"
+scen() { cat "$SCEN/$1" 2>/dev/null || printf '%s' "${2:-}"; }
+
+# Loopback-Tests der Faehigkeitserkennung immer beantworten.
+case " $* " in
+*" 127.0.0.1 "*) exit "$(scen ping_lo_rc 0)" ;;
+esac
+
+# Optionale Folge von Rueckgabewerten, damit sich Toleranz und Erholung
+# ueber mehrere Zyklen hinweg pruefen lassen. Der letzte Wert wiederholt sich.
+if [ -r "$SCEN/ping_rc_sequence" ]; then
+	read -r -a seq <"$SCEN/ping_rc_sequence"
+	idx=$(cat "$SCEN/ping_rc_index" 2>/dev/null || printf '0')
+	printf '%s' "$((idx + 1))" >"$SCEN/ping_rc_index"
+	last=$(( ${#seq[@]} - 1 ))
+	[ "$idx" -gt "$last" ] && idx="$last"
+	exit "${seq[$idx]}"
+fi
+
+exit "$(scen ping_rc 0)"

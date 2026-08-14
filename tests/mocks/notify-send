@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Mock fuer notify-send – schreibt die Meldung ins Protokoll.
+set -uo pipefail
+printf 'notify-send %s\n' "$*" >>"$MOCK_LOG"
+exit 0

@@ -1,0 +1,506 @@
+#!/usr/bin/env bash
+#
+# wg-guard – Watchdog fuer eine bestehende WireGuard-Verbindung.
+#
+# Oberstes Ziel: Der Rechner darf unter keinen Umstaenden seine normale
+# Internetverbindung verlieren, weil der Tunnel Probleme hat. Im Zweifel ist der
+# korrekte Zustand: Tunnel unten. Der Tunnel wird nur hochgefahren und oben
+# gelassen, wenn kaskadiert nachgewiesen ist, dass er funktioniert.
+
+set -euo pipefail
+
+# ------------------------------------------------------------ Bootstrap -----
+# Der Installer ersetzt @LIBDIR@. Ohne Ersetzung greift der Repository-Pfad.
+if [ -z "${WG_GUARD_LIBDIR:-}" ]; then
+	WG_GUARD_LIBDIR="@LIBDIR@/wg-guard"
+	[ -d "$WG_GUARD_LIBDIR/lib" ] ||
+		WG_GUARD_LIBDIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+fi
+if [ -r "$WG_GUARD_LIBDIR/VERSION" ]; then
+	WG_GUARD_VERSION="$(cat "$WG_GUARD_LIBDIR/VERSION")"
+elif [ -r "$WG_GUARD_LIBDIR/../VERSION" ]; then
+	WG_GUARD_VERSION="$(cat "$WG_GUARD_LIBDIR/../VERSION")"
+else
+	WG_GUARD_VERSION="unbekannt"
+fi
+export WG_GUARD_VERSION
+# shellcheck source=lib/common.sh
+. "$WG_GUARD_LIBDIR/lib/common.sh"
+# shellcheck source=lib/platform.sh
+. "$WG_GUARD_LIBDIR/lib/platform.sh"
+# shellcheck source=lib/nm.sh
+. "$WG_GUARD_LIBDIR/lib/nm.sh"
+# shellcheck source=lib/safety.sh
+. "$WG_GUARD_LIBDIR/lib/safety.sh"
+# shellcheck source=lib/probes.sh
+. "$WG_GUARD_LIBDIR/lib/probes.sh"
+
+load_config
+
+# ------------------------------------------------------------- Zustand ------
+
+ST_STATE="START"
+ST_SINCE="$(now)"
+ST_LAST_STAGE_OK=""
+ST_LAST_FAIL_STAGE=""
+ST_LAST_FAIL_REASON=""
+ST_LAST_FAIL_TS=0
+ST_LAST_HEALTHY_TS=0
+ST_NEXT_ATTEMPT=0
+ST_CONSEC_FAILS=0
+ST_HEALTH_FAILS=0
+ST_BACKOFF=0
+ST_TUNNEL="unbekannt"
+
+FAIL_TIMES=()   # Zeitstempel der Fehlschlaege fuer die Hysterese
+LAST_WAKE=0     # fuer die Entprellung der Aufweck-Signale
+SHUTTING_DOWN=0 # verhindert, dass der ERR-Trap waehrend des Beendens feuert
+IN_ERROR_TRAP=0
+
+set_state() {
+	local new="$1"
+	if [ "$new" != "$ST_STATE" ]; then
+		ST_STATE="$new"
+		ST_SINCE="$(now)"
+	fi
+	state_write
+}
+
+record_failure() {
+	local stage="$1" reason="$2"
+	ST_LAST_FAIL_STAGE="$stage"
+	ST_LAST_FAIL_REASON="$reason"
+	ST_LAST_FAIL_TS="$(now)"
+	ST_CONSEC_FAILS=$((ST_CONSEC_FAILS + 1))
+	FAIL_TIMES+=("$(now)")
+}
+
+reset_failures() {
+	ST_CONSEC_FAILS=0
+	ST_HEALTH_FAILS=0
+	ST_BACKOFF=0
+	ST_NEXT_ATTEMPT=0
+	ST_LAST_FAIL_STAGE=""
+	ST_LAST_FAIL_REASON=""
+	FAIL_TIMES=()
+}
+
+# ------------------------------------------------- Backoff und Hysterese ----
+
+# Verwirft Fehlschlaege, die aelter als das Hysteresefenster sind.
+prune_fail_times() {
+	local cutoff keep=() t
+	cutoff=$(($(now) - HYSTERESIS_WINDOW))
+	for t in ${FAIL_TIMES[@]+"${FAIL_TIMES[@]}"}; do
+		if [ "$t" -ge "$cutoff" ]; then keep+=("$t"); fi
+	done
+	FAIL_TIMES=(${keep[@]+"${keep[@]}"})
+}
+
+# Exponentieller Backoff mit Jitter und Obergrenze.
+compute_backoff() {
+	local n="$ST_CONSEC_FAILS" value="$BACKOFF_INITIAL" i
+	if [ "$n" -lt 1 ]; then n=1; fi
+	for ((i = 1; i < n; i++)); do
+		value=$((value * BACKOFF_FACTOR))
+		if [ "$value" -ge "$BACKOFF_MAX" ]; then
+			value="$BACKOFF_MAX"
+			break
+		fi
+	done
+	if [ "$value" -gt "$BACKOFF_MAX" ]; then value="$BACKOFF_MAX"; fi
+
+	# Jitter, damit nicht alle Versuche im Gleichtakt laufen.
+	local span jitter
+	span=$((value * BACKOFF_JITTER_PCT / 100))
+	if [ "$span" -gt 0 ]; then
+		jitter=$(($(rand_below $((2 * span + 1))) - span))
+		value=$((value + jitter))
+	fi
+	if [ "$value" -lt 1 ]; then value=1; fi
+	printf '%s' "$value"
+}
+
+# Nach zu vielen Fehlschlaegen im Fenster eine deutlich laengere Ruhephase,
+# damit nicht endlos gegen eine tote Gegenstelle gelaufen wird.
+enter_backoff() {
+	# Der Zielzustand ist normalerweise BACKOFF; bei einem Konfigurationsproblem
+	# soll aber sichtbar bleiben, dass es kein blosses Netzproblem war.
+	local target="${1:-BACKOFF}"
+	prune_fail_times
+	if [ "${#FAIL_TIMES[@]}" -ge "$HYSTERESIS_FAILURES" ]; then
+		ST_BACKOFF="$HYSTERESIS_COOLDOWN"
+		ST_NEXT_ATTEMPT=$(($(now) + ST_BACKOFF))
+		FAIL_TIMES=()
+		log_warn "Hysterese greift: $HYSTERESIS_FAILURES Fehlschlaege im Fenster. Ruhephase $(human_duration "$ST_BACKOFF")."
+		set_state "COOLDOWN"
+		return 0
+	fi
+	ST_BACKOFF="$(compute_backoff)"
+	ST_NEXT_ATTEMPT=$(($(now) + ST_BACKOFF))
+	log_info "Naechster Versuch in $(human_duration "$ST_BACKOFF")."
+	set_state "$target"
+}
+
+# ------------------------------------------------------ Netz-Fingerprint ----
+
+# Identitaet des aktuellen Netzes. Ein Aufweck-Signal darf den Backoff nur
+# abkuerzen, wenn sich diese Identitaet geaendert hat – sonst hebelt ein
+# Ereignissturm des Dispatchers die Hysterese aus.
+net_fingerprint() {
+	local routes conns
+	routes="$(run_timeout "$CMD_TIMEOUT" ip route show default 2>/dev/null || true)"
+	conns="$(run_timeout "$CMD_TIMEOUT" nmcli -t -f UUID,DEVICE connection show --active 2>/dev/null || true)"
+	# Die eigene Verbindung ausblenden, sonst aendert sich der Fingerprint,
+	# sobald wir selbst den Tunnel hoch- oder herunterfahren.
+	printf '%s|%s' \
+		"$(printf '%s' "$routes" | grep -v "dev $WG_INTERFACE" | tr '\n' ';')" \
+		"$(printf '%s' "$conns" | grep -v ":$WG_INTERFACE\$" | tr '\n' ';')"
+}
+
+fingerprint_changed() {
+	local current previous
+	current="$(net_fingerprint)"
+	previous=""
+	if [ -r "$FINGERPRINT_FILE" ]; then previous="$(cat "$FINGERPRINT_FILE")"; fi
+	if [ "$current" != "$previous" ]; then
+		mkdir -p "$STATEDIR" 2>/dev/null || true
+		printf '%s' "$current" >"$FINGERPRINT_FILE"
+		return 0
+	fi
+	return 1
+}
+
+# ------------------------------------------------------ Signalbehandlung ----
+
+on_wake() {
+	local t
+	t="$(now)"
+	if [ $((t - LAST_WAKE)) -lt "$WAKE_DEBOUNCE" ]; then
+		return 0
+	fi
+	LAST_WAKE="$t"
+	WOKEN=1
+	interrupt_sleep
+}
+
+on_term() {
+	SHUTTING_DOWN=1
+	log_info "Signal empfangen, beende den Dienst und fahre den Tunnel definiert herunter."
+	interrupt_sleep
+	ensure_down "Dienst wird beendet" || true
+	set_state "BEENDET"
+	rm -f "$PID_FILE"
+	exit 0
+}
+
+on_hup() {
+	log_info "Konfiguration wird neu geladen."
+	load_config
+	interrupt_sleep
+}
+
+# Jeder unerwartete Fehler fuehrt zum Herunterfahren. Lieber ein Neustart durch
+# systemd als ein Tunnel, ueber dessen Zustand nichts bekannt ist.
+on_error() {
+	local line="$1"
+	if [ "$SHUTTING_DOWN" -eq 1 ]; then return 0; fi
+	if [ "$IN_ERROR_TRAP" -eq 1 ]; then exit 1; fi
+	IN_ERROR_TRAP=1
+	log_error "Unerwarteter Fehler in Zeile $line. Fail-safe: der Tunnel wird heruntergefahren."
+	ensure_down "unerwarteter Fehler" || true
+	set_state "FEHLER"
+	rm -f "$PID_FILE"
+	exit 1
+}
+
+trap 'on_error $LINENO' ERR
+trap on_term TERM INT
+trap on_wake USR1
+trap on_hup HUP
+
+# --------------------------------------------------------- Gesundheit -------
+
+# Vollstaendige Gesundheitspruefung eines bereits laufenden Tunnels.
+# Rueckgabe: 0 gesund, 1 Sonde fehlgeschlagen (Toleranz greift),
+#            3 Sicherheitsverletzung (sofort herunterfahren).
+health_check() {
+	if ! check_default_route_safe; then
+		STAGE_REASON="$SAFETY_REASON"
+		HEALTH_STAGE="Q"
+		return 3
+	fi
+	if ! stage3_handshake_quick; then
+		HEALTH_STAGE="3"
+		return 1
+	fi
+	local rc=0
+	stage4_ping || rc=$?
+	if [ "$rc" -ne 0 ]; then
+		HEALTH_STAGE="4"
+		return "$rc"
+	fi
+	rc=0
+	stage5_tcp || rc=$?
+	if [ "$rc" -ne 0 ]; then
+		HEALTH_STAGE="5"
+		return "$rc"
+	fi
+	return 0
+}
+
+# ------------------------------------------------------- Aufbau-Zyklus ------
+
+# Faehrt die Kaskade von Stufe 1 bis 5 durch. Rueckgabe 0 = gesund.
+attempt_connect() {
+	local rc=0
+
+	if ! stage1_resolve_endpoint; then
+		record_failure "1" "$STAGE_REASON"
+		log_info "Stufe 1 fehlgeschlagen: $STAGE_REASON"
+		return 1
+	fi
+	ST_LAST_STAGE_OK="1"
+
+	set_state "VERBINDET"
+	stage2_bring_up || rc=$?
+	if [ "$rc" -ne 0 ]; then
+		record_failure "2" "$STAGE_REASON"
+		case "$rc" in
+		2) log_error "Stufe 2 abgebrochen: $STAGE_REASON" ;;
+		3) log_error "Stufe 2 – Sicherheitsverletzung: $STAGE_REASON" ;;
+		*) log_info "Stufe 2 fehlgeschlagen: $STAGE_REASON" ;;
+		esac
+		ensure_down "Stufe 2 fehlgeschlagen" || true
+		if [ "$rc" -eq 2 ]; then PREFLIGHT_BLOCKED=1; fi
+		return 1
+	fi
+	ST_LAST_STAGE_OK="2"
+	ST_TUNNEL="up"
+
+	if ! stage3_handshake; then
+		record_failure "3" "$STAGE_REASON"
+		log_info "Stufe 3 fehlgeschlagen: $STAGE_REASON"
+		ensure_down "kein frischer Handshake" || true
+		return 1
+	fi
+	ST_LAST_STAGE_OK="3"
+
+	rc=0
+	stage4_ping || rc=$?
+	if [ "$rc" -ne 0 ]; then
+		record_failure "4" "$STAGE_REASON"
+		log_info "Stufe 4 fehlgeschlagen: $STAGE_REASON"
+		ensure_down "interner Host nicht erreichbar" || true
+		return 1
+	fi
+	ST_LAST_STAGE_OK="4"
+
+	rc=0
+	stage5_tcp || rc=$?
+	if [ "$rc" -ne 0 ]; then
+		record_failure "5" "$STAGE_REASON"
+		log_info "Stufe 5 fehlgeschlagen: $STAGE_REASON"
+		ensure_down "interner Dienst nicht erreichbar" || true
+		return 1
+	fi
+	ST_LAST_STAGE_OK="5"
+
+	return 0
+}
+
+mark_healthy() {
+	reset_failures
+	ST_TUNNEL="up"
+	ST_LAST_HEALTHY_TS="$(now)"
+	if [ "$ST_STATE" != "GESUND" ]; then
+		log_info "Tunnel ist gesund (alle Stufen bestanden)."
+	fi
+	set_state "GESUND"
+}
+
+# ----------------------------------------------------------- Hauptlauf ------
+
+main_loop() {
+	local interval rc cycle=0
+
+	while :; do
+		# Test-Hook: begrenzt die Schleife, damit die Testsuite die
+		# Zustandsmaschine deterministisch durchfahren kann.
+		cycle=$((cycle + 1))
+		if [ -n "${WG_GUARD_MAX_CYCLES:-}" ] && [ "$cycle" -gt "$WG_GUARD_MAX_CYCLES" ]; then
+			log_debug "Zyklengrenze erreicht, beende die Schleife."
+			return 0
+		fi
+
+		WOKEN=0
+		PREFLIGHT_BLOCKED=0
+
+		# Pausiert – der Tunnel bleibt unten, egal was sonst gilt.
+		if is_paused; then
+			ensure_down "Pause aktiv" || true
+			set_state "PAUSIERT"
+			wait_interval "$CHECK_INTERVAL_IDLE"
+			continue
+		fi
+
+		# Stufe 0 – Ruhezustand, kein Fehler, kein Backoff-Zaehler.
+		if ! stage0_network_ready; then
+			if ! tunnel_is_down; then
+				ensure_down "kein nutzbares Netz" || true
+			fi
+			if [ "$ST_STATE" != "RUHE" ]; then
+				log_info "Ruhezustand: $STAGE_REASON"
+			fi
+			ST_TUNNEL="down"
+			set_state "RUHE"
+			wait_interval "$CHECK_INTERVAL_IDLE"
+			continue
+		fi
+
+		# Bereits gesund: nur nachpruefen.
+		if [ "$ST_STATE" = "GESUND" ] && nm_is_active; then
+			rc=0
+			health_check || rc=$?
+			case "$rc" in
+			0)
+				ST_HEALTH_FAILS=0
+				mark_healthy
+				wait_interval "$CHECK_INTERVAL_HEALTHY"
+				continue
+				;;
+			3)
+				log_error "Sicherheitsverletzung im laufenden Betrieb: $STAGE_REASON"
+				record_failure "${HEALTH_STAGE:-Q}" "$STAGE_REASON"
+				ensure_down "Sicherheitsverletzung" || true
+				enter_backoff
+				wait_interval "$CHECK_INTERVAL_DEGRADED"
+				continue
+				;;
+			*)
+				ST_HEALTH_FAILS=$((ST_HEALTH_FAILS + 1))
+				if [ "$ST_HEALTH_FAILS" -lt "$HEALTH_FAILURES_BEFORE_DOWN" ]; then
+					log_info "Stufe ${HEALTH_STAGE:-?} fehlgeschlagen ($ST_HEALTH_FAILS/$HEALTH_FAILURES_BEFORE_DOWN): $STAGE_REASON"
+					state_write
+					wait_interval "$CHECK_INTERVAL_DEGRADED"
+					continue
+				fi
+				log_info "Tunnel gilt als ungesund (Stufe ${HEALTH_STAGE:-?}): $STAGE_REASON"
+				record_failure "${HEALTH_STAGE:-?}" "$STAGE_REASON"
+				ensure_down "Gesundheitspruefung fehlgeschlagen" || true
+				enter_backoff
+				wait_interval "$CHECK_INTERVAL_DEGRADED"
+				continue
+				;;
+			esac
+		fi
+
+		# In Backoff oder Cooldown: warten, solange sich das Netz nicht geaendert hat.
+		if [ "$ST_NEXT_ATTEMPT" -gt 0 ] && [ "$(now)" -lt "$ST_NEXT_ATTEMPT" ]; then
+			interval=$((ST_NEXT_ATTEMPT - $(now)))
+			if [ "$interval" -gt "$CHECK_INTERVAL_IDLE" ]; then interval="$CHECK_INTERVAL_IDLE"; fi
+			state_write
+			wait_interval "$interval"
+			if [ "$WOKEN" -eq 1 ] && fingerprint_changed; then
+				log_info "Das Netz hat sich geaendert, Wartezeit wird abgekuerzt."
+				ST_NEXT_ATTEMPT=0
+			fi
+			continue
+		fi
+
+		# Voller Verbindungsaufbau.
+		fingerprint_changed || true
+		if attempt_connect; then
+			mark_healthy
+			wait_interval "$CHECK_INTERVAL_HEALTHY"
+			continue
+		fi
+
+		if [ "${PREFLIGHT_BLOCKED:-0}" -eq 1 ]; then
+			enter_backoff "PREFLIGHT_FEHLER"
+		else
+			enter_backoff
+		fi
+		wait_interval "$CHECK_INTERVAL_DEGRADED"
+	done
+}
+
+# --------------------------------------------------------------- Start ------
+
+usage() {
+	cat <<'EOF'
+wg-guard-daemon – Watchdog fuer eine WireGuard-Verbindung.
+
+Aufruf:
+  wg-guard-daemon              Daemon starten (normalerweise ueber systemd)
+  wg-guard-daemon --down-only  Tunnel definiert herunterfahren und beenden
+  wg-guard-daemon --help       diese Hilfe
+EOF
+}
+
+main() {
+	case "${1:-}" in
+	--help | -h)
+		usage
+		exit 0
+		;;
+	--down-only)
+		# Rueckfallebene fuer ExecStopPost: auch wenn der Daemon abgestuerzt ist,
+		# bleibt der Tunnel nicht unbeaufsichtigt oben.
+		if ! config_is_complete; then
+			log_warn "$CONFIG_ERROR"
+			exit 0
+		fi
+		ensure_down "ExecStopPost" || exit 1
+		exit 0
+		;;
+	"") ;;
+	*)
+		usage
+		exit 2
+		;;
+	esac
+
+	require_root
+
+	if ! config_is_complete; then
+		log_error "$CONFIG_ERROR"
+		log_error "Bitte 'wg-guard setup' ausfuehren."
+		exit 78 # EX_CONFIG
+	fi
+
+	mkdir -p "$RUNDIR" "$STATEDIR"
+	chmod 0755 "$STATEDIR" 2>/dev/null || true
+
+	# Lockfile gegen Parallellaeufe.
+	exec 9>"$LOCK_FILE"
+	if ! flock -n 9; then
+		log_error "Ein anderer wg-guard-Daemon laeuft bereits."
+		exit 1
+	fi
+	printf '%s' "$$" >"$PID_FILE"
+
+	log_info "wg-guard $WG_GUARD_VERSION gestartet (Verbindung \"$NM_CONNECTION\", Interface $WG_INTERFACE)."
+
+	# Ausgangszustand: Ein laufender Tunnel wird nicht blind gekappt, sondern
+	# sofort geprueft. Besteht er die Pruefung nicht, geht er herunter.
+	if nm_is_active && ! is_paused; then
+		local rc=0
+		health_check || rc=$?
+		if [ "$rc" -eq 0 ]; then
+			log_info "Vorgefundener Tunnel ist gesund und wird uebernommen."
+			mark_healthy
+		else
+			log_info "Vorgefundener Tunnel besteht die Pruefung nicht (Stufe ${HEALTH_STAGE:-?}): $STAGE_REASON"
+			ensure_down "Ausgangszustand unklar" || true
+			set_state "BACKOFF"
+		fi
+	else
+		ensure_down "Ausgangszustand herstellen" || true
+		set_state "START"
+	fi
+
+	main_loop
+}
+
+main "$@"

@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Mock fuer getent.
+set -uo pipefail
+printf 'getent %s\n' "$*" >>"$MOCK_LOG"
+scen() { cat "$SCEN/$1" 2>/dev/null || printf '%s' "${2:-}"; }
+case "${1:-}" in
+ahosts|hosts)
+	if [ "$(scen dns_rc 0)" != "0" ]; then exit "$(scen dns_rc 0)"; fi
+	printf '198.51.100.7 STREAM %s\n' "${2:-host}"
+	exit 0
+	;;
+group)
+	exit 2
+	;;
+esac
+exit 0
