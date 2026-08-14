@@ -129,6 +129,8 @@ cmd_status() {
 	VERBINDET) desc="Verbindungsaufbau laeuft" ;;
 	PREFLIGHT_FEHLER) desc="Konfiguration der NM-Verbindung ist nicht sicher" ;;
 	FEHLER) desc="unerwarteter Fehler, Tunnel wurde heruntergefahren" ;;
+	BEENDET) desc="Dienst wurde beendet" ;;
+	START) desc="startet gerade, erste Pruefung laeuft" ;;
 	*) desc="" ;;
 	esac
 
@@ -139,6 +141,9 @@ cmd_status() {
 		say "  Dienst:     laeuft NICHT (sudo systemctl start $SERVICE_NAME)"
 	fi
 	say "  Zustand:    $st${desc:+ ($desc)}"
+	if [ "$st" = "BEENDET" ] && systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
+		say "              (Der Dienst startet gerade neu – dieser Stand ist von vorher.)"
+	fi
 	say "  seit:       $(human_timestamp "$since") – vor $(human_duration "$(($(now) - since))")"
 	say "  Tunnel:     $tunnel"
 	say "  Pausiert:   $([ "$paused" = "yes" ] && printf 'ja' || printf 'nein')"
@@ -770,6 +775,12 @@ cmd_migrate() {
 		config_set TUNNEL_MODE "split"
 		say "Betriebsart split eingetragen. Der Preflight wird das Hochfahren"
 		say "verweigern, solange die AllowedIPs eine Default-Route enthalten."
+	fi
+
+	# Ohne Neustart laeuft der Daemon mit der alten Konfiguration weiter.
+	if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
+		say "Starte den Dienst neu, damit die Aenderung wirkt ..."
+		systemctl restart "$SERVICE_NAME" || true
 	fi
 
 	say ""

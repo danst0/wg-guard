@@ -496,6 +496,11 @@ main() {
 	fi
 	printf '%s' "$$" >"$PID_FILE"
 
+	# Sofort schreiben: die erste Pruefung kann Sekunden dauern, und solange
+	# wuerde "wg-guard status" den Stand des vorherigen Laufs zeigen.
+	ST_SINCE="$(now)"
+	set_state "START"
+
 	log_info "wg-guard $WG_GUARD_VERSION gestartet (Verbindung \"$NM_CONNECTION\", Interface $WG_INTERFACE)."
 
 	# Ausgangszustand: Ein laufender Tunnel wird nicht blind gekappt, sondern
