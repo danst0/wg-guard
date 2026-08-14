@@ -273,15 +273,24 @@ preflight_run() {
 	fi
 
 	# P7 – Policy-Routing darf never-default nicht aushebeln.
+	# Achtung: nmcli gibt diese Eigenschaft numerisch aus (-1 automatisch,
+	# 0 aus, 1 erzwungen an), nicht als yes/no.
 	for key in wireguard.ip4-auto-default-route wireguard.ip6-auto-default-route; do
 		val="$(nm_get "$key")" || val=""
 		case "$val" in
-		"true" | "yes")
+		"1" | "true" | "yes")
 			preflight_add P7 fail "$key ist erzwungen aktiviert und umgeht never-default." \
 				"$nmcli_mod $key default"
 			;;
+		"-1" | "" | "default")
+			preflight_add P7 ok "$key ist automatisch (-1) und ohne /0-Peer wirkungslos."
+			;;
+		"0" | "false" | "no")
+			preflight_add P7 ok "$key ist deaktiviert."
+			;;
 		*)
-			preflight_add P7 ok "$key ist \"${val:-default}\"."
+			# Nicht interpretierbar heisst im Zweifel: nicht hochfahren.
+			preflight_add P7 fail "$key hat den unerwarteten Wert \"$val\" und laesst sich nicht beurteilen."
 			;;
 		esac
 	done
@@ -289,6 +298,10 @@ preflight_run() {
 	# P8 – Ueberlappung mit dem lokalen Netz wuerde das LAN blackholen.
 	if [ "$ALLOW_LAN_OVERLAP" = "yes" ]; then
 		preflight_add P8 warn "Ueberlappungspruefung ist per ALLOW_LAN_OVERLAP deaktiviert."
+	elif [ "$has_default" -eq 1 ]; then
+		# Eine Default-Route ueberlappt naturgemaess mit jedem lokalen Netz.
+		# Das ist bereits P4; eine zweite Meldung waere nur Rauschen.
+		preflight_add P8 ok "Ueberlappung nicht separat geprueft – siehe P4."
 	elif ips="$(nm_allowed_ips)"; then
 		local conflict
 		if conflict="$(find_lan_overlap "$ips")"; then
