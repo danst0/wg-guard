@@ -5,4 +5,4 @@ make_fake_release "9.9.9"
 run_update
 assert_eq "$(installed_version)" "9.9.9" "Die neue Version muss installiert sein"
 assert_log_contains 'systemctl restart' "Der Dienst muss neu gestartet werden"
-assert_true test -d "$SB/state/backup/0.1.0" "Es muss eine Sicherung angelegt worden sein"
+assert_true test -d "$SB/state/backup/$(repo_version)" "Es muss eine Sicherung angelegt worden sein"

@@ -297,6 +297,8 @@ run_update() {
 
 update_output() { cat "$SB/update.out" 2>/dev/null; }
 installed_version() { cat "$SB_LIBDIR/wg-guard/VERSION" 2>/dev/null; }
+# Die Version des Arbeitsstands - Tests duerfen sie nicht hartkodieren.
+repo_version() { cat "$REPO_ROOT/VERSION"; }
 
 # ------------------------------------------------------- Bibliothekstests ---
 
