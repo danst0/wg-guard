@@ -96,10 +96,10 @@ human_duration() {
 
 human_timestamp() {
 	local ts="${1:-}"
-	[ -n "$ts" ] && [ "$ts" -gt 0 ] 2>/dev/null || {
+	if ! { [ -n "$ts" ] && [ "$ts" -gt 0 ] 2>/dev/null; }; then
 		printf 'unbekannt'
 		return 0
-	}
+	fi
 	date -d "@$ts" '+%d.%m.%Y %H:%M:%S' 2>/dev/null || printf '%s' "$ts"
 }
 

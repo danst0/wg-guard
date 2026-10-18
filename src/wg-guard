@@ -851,7 +851,7 @@ EOF
 
 main() {
 	local cmd="${1:-status}"
-	[ "$#" -gt 0 ] && shift || true
+	if [ "$#" -gt 0 ]; then shift; fi
 	case "$cmd" in
 	status) cmd_status "$@" ;;
 	check) cmd_check "$@" ;;
